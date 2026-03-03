@@ -1,0 +1,13 @@
+{
+  "agents": {
+    "oc": {
+      "name": "OpenClaw",
+      "owner": "michael",
+      "role": "full",
+      "trust_level": "owner",
+      "hmac_secret_env": "GW_HMAC_OC",
+      "rate_limit": 15,
+      "status": "active"
+    }
+  }
+}

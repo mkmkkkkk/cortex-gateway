@@ -1,0 +1,12 @@
+# Runtime
+data/
+logs/
+__pycache__/
+*.pyc
+
+# Secrets
+.env
+agent-registry.json
+
+# OS
+.DS_Store
