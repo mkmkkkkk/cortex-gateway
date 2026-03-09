@@ -82,8 +82,9 @@ _load_env()
 TG_BOT_TOKEN = os.environ.get("CORTEX_TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("CORTEX_TG_CHAT_ID", "")
 TG_CEO_USER_ID = os.environ.get("CORTEX_TG_CEO_USER_ID", "")  # CEO's TG user_id for per-user auth
-CC_MCP_URL = os.environ.get("CC_MCP_URL", "")  # CC's Cloudflare Tunnel endpoint (dynamically updatable via /update-tunnel-url)
-CC_TUNNEL_SECRET = os.environ.get("CC_TUNNEL_SECRET", "")  # Auth for /update-tunnel-url endpoint
+CC_MCP_URL = os.environ.get("CC_MCP_URL", "")  # CC's Cloudflare Tunnel endpoint (dynamically updatable)
+CC_TUNNEL_SECRET = os.environ.get("CC_TUNNEL_SECRET", "")  # Shared secret for URL encryption/decryption
+DNS_TUNNEL_RECORD = os.environ.get("DNS_TUNNEL_RECORD", "_cortex.mkyang.ai")  # TXT record with encrypted URL
 CC_HMAC_SECRET = os.environ.get("CORTEX_HMAC_SECRET_OC", "")  # Gateway → CC auth
 GW_CALLBACK_SECRET = os.environ.get("GW_CALLBACK_SECRET", "")  # CC → Gateway callback auth
 GW_CALLBACK_URL = os.environ.get("GW_CALLBACK_URL", "")  # Gateway's own callback URL (e.g., http://localhost:8750/callback)
@@ -1142,25 +1143,8 @@ def _tg_poller():
             for msg in messages:
                 text = msg.get("text", "")
 
-                # Auto-sync tunnel URL: /tunnel_url sent by CC's Heartbeat bot
-                # Uses /command format so it works even with bot privacy mode ON.
-                # Validates sender = Heartbeat bot (ID 8747385270) to prevent spoofing.
-                if (msg.get("is_bot")
-                        and msg.get("from_id") == 8747385270
-                        and text.startswith("/tunnel_url ")):
-                    new_url = text.split(" ", 1)[1].strip()
-                    if new_url.startswith("https://") and ".trycloudflare.com" in new_url:
-                        global CC_MCP_URL
-                        CC_MCP_URL = new_url
-                        _log(f"CC tunnel URL auto-synced: {new_url}")
-                        _audit("tunnel_url_synced", source="heartbeat_bot", url=new_url)
-                        _tg_send(f"✅ CC tunnel URL synced: <code>{new_url}</code>", html=True)
-                    else:
-                        _log(f"Rejected tunnel URL (invalid format): {new_url[:100]}")
-                    continue
-
                 if msg.get("is_bot"):
-                    continue  # ignore other bot messages
+                    continue  # ignore bot messages
                 if text.startswith("/"):
                     _handle_tg_command(text, msg.get("from_name", "?"), msg.get("chat_id", 0), msg.get("from_id", 0))
             consecutive_errors = 0
@@ -1209,6 +1193,64 @@ def _relay_worker():
                 # CC offline — stop processing, retry later
                 _log(f"CC relay failed for {req_id}: {result.get('error', '?')}")
                 break
+
+
+def _decrypt_tunnel_url(token: str) -> str:
+    """Decrypt tunnel URL token using CC_TUNNEL_SECRET. Pure Python, zero deps."""
+    import base64
+    raw = base64.urlsafe_b64decode(token)
+    if len(raw) < 17:
+        return ""
+    iv, ct = raw[:16], raw[16:]
+    key = hashlib.pbkdf2_hmac("sha256", CC_TUNNEL_SECRET.encode(), b"cortex-dns-sync", 100000)
+    out = bytearray()
+    for i in range(0, len(ct), 32):
+        bk = hashlib.sha256(key + iv + i.to_bytes(4, "big")).digest()
+        for j in range(min(32, len(ct) - i)):
+            out.append(ct[i + j] ^ bk[j])
+    return bytes(out).decode("utf-8", errors="replace")
+
+
+def _dns_url_sync():
+    """Background thread: poll DNS TXT record for encrypted CC tunnel URL."""
+    global CC_MCP_URL
+    if not CC_TUNNEL_SECRET:
+        _log("DNS URL sync disabled (CC_TUNNEL_SECRET not set)")
+        return
+    # Pre-derive key once (PBKDF2 is slow)
+    _log(f"DNS URL sync started — polling {DNS_TUNNEL_RECORD}")
+    while True:
+        try:
+            # Resolve TXT via DNS-over-HTTPS (no dig/nslookup dependency)
+            import urllib.request
+            req = urllib.request.Request(
+                f"https://cloudflare-dns.com/dns-query?name={DNS_TUNNEL_RECORD}&type=TXT",
+                headers={"Accept": "application/dns-json"}
+            )
+            resp = json.load(urllib.request.urlopen(req, timeout=10))
+            answers = resp.get("Answer", [])
+            if not answers:
+                time.sleep(60)
+                continue
+
+            txt_value = answers[0].get("data", "").strip('"')
+            if not txt_value:
+                time.sleep(60)
+                continue
+
+            # Decrypt
+            new_url = _decrypt_tunnel_url(txt_value)
+            if (new_url.startswith("https://")
+                    and ".trycloudflare.com" in new_url
+                    and new_url != CC_MCP_URL):
+                CC_MCP_URL = new_url
+                _log(f"CC URL synced via DNS: {new_url}")
+                _audit("tunnel_url_synced", source="dns", url=new_url)
+                _tg_send(f"CC tunnel URL synced via DNS:\n{new_url}", html=False)
+        except Exception as e:
+            _log(f"DNS sync error: {e}")
+
+        time.sleep(60)
 
 
 # ── Entry Point ───────────────────────────────────────────────────
@@ -1435,5 +1477,6 @@ if __name__ == "__main__":
     # Start background workers
     threading.Thread(target=_tg_poller, daemon=True).start()
     threading.Thread(target=_relay_worker, daemon=True).start()
+    threading.Thread(target=_dns_url_sync, daemon=True).start()
 
     uvicorn.run(auth_middleware, host="127.0.0.1", port=port)
