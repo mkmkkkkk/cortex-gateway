@@ -1264,11 +1264,26 @@ if __name__ == "__main__":
         idx = sys.argv.index("--port")
         port = int(sys.argv[idx + 1])
 
+    # ── Startup self-check ──────────────────────────────────────────
+    # Hard-fail on missing critical env vars so OC doesn't run broken.
+    _required_env = {
+        "CC_TUNNEL_SECRET": CC_TUNNEL_SECRET,
+        "CORTEX_HMAC_SECRET_OC": CC_HMAC_SECRET,
+        "CORTEX_TG_BOT_TOKEN": TG_BOT_TOKEN,
+        "CORTEX_TG_CHAT_ID": TG_CHAT_ID,
+    }
+    _missing = [k for k, v in _required_env.items() if not v]
+    if _missing:
+        print(f"\n❌ FATAL: Missing required env vars: {', '.join(_missing)}")
+        print(f"   Copy .env.example → .env and fill in ALL values.")
+        print(f"   Then restart: python3 gateway-server.py\n")
+        sys.exit(1)
+
     registry = _load_registry()
     agent_count = len(registry.get("agents", {}))
     _log(f"Starting Cortex Gateway on :{port}")
-    _log(f"Agents: {agent_count} | CC: {'configured' if CC_MCP_URL else 'NOT configured'}")
-    _log(f"TG: {'configured' if TG_BOT_TOKEN else 'NOT configured'} | CEO user_id: {'set' if TG_CEO_USER_ID else 'NOT set (any group member can command)'}")
+    _log(f"Agents: {agent_count} | CC: {'DNS auto-sync' if CC_TUNNEL_SECRET else 'manual'}")
+    _log(f"TG: configured | CEO user_id: {'set' if TG_CEO_USER_ID else 'NOT set (any group member can command)'}")
     _log(f"Sensitivity rules: {len(RULES.get('block_keywords', []))} block, "
          f"{len(RULES.get('hold_keywords', []))} hold")
 
