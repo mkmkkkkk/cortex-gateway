@@ -1142,15 +1142,21 @@ def _tg_poller():
             for msg in messages:
                 text = msg.get("text", "")
 
-                # Auto-detect tunnel URL from CC's Heartbeat bot (cross-bot sync)
-                if msg.get("is_bot") and text.startswith("[CC_TUNNEL_URL] "):
-                    new_url = text.replace("[CC_TUNNEL_URL] ", "").strip()
+                # Auto-sync tunnel URL: /tunnel_url sent by CC's Heartbeat bot
+                # Uses /command format so it works even with bot privacy mode ON.
+                # Validates sender = Heartbeat bot (ID 8747385270) to prevent spoofing.
+                if (msg.get("is_bot")
+                        and msg.get("from_id") == 8747385270
+                        and text.startswith("/tunnel_url ")):
+                    new_url = text.split(" ", 1)[1].strip()
                     if new_url.startswith("https://") and ".trycloudflare.com" in new_url:
                         global CC_MCP_URL
                         CC_MCP_URL = new_url
-                        _log(f"CC tunnel URL auto-updated via TG: {new_url}")
-                        _audit("tunnel_url_synced", source="tg_bot", url=new_url)
+                        _log(f"CC tunnel URL auto-synced: {new_url}")
+                        _audit("tunnel_url_synced", source="heartbeat_bot", url=new_url)
                         _tg_send(f"✅ CC tunnel URL synced: <code>{new_url}</code>", html=True)
+                    else:
+                        _log(f"Rejected tunnel URL (invalid format): {new_url[:100]}")
                     continue
 
                 if msg.get("is_bot"):
