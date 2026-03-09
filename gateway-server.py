@@ -1418,4 +1418,5 @@ if __name__ == "__main__":
     threading.Thread(target=_tg_poller, daemon=True).start()
     threading.Thread(target=_relay_worker, daemon=True).start()
 
-    uvicorn.run(auth_middleware, host="127.0.0.1", port=port)
+    bind_host = os.environ.get("GW_BIND_HOST", "0.0.0.0")
+    uvicorn.run(auth_middleware, host=bind_host, port=port)
