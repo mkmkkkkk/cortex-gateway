@@ -1,0 +1,8 @@
+.env
+agent-registry.json
+data/
+logs/
+__pycache__/
+*.pyc
+*.tmp
+*.log
