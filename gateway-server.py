@@ -1140,9 +1140,21 @@ def _tg_poller():
                     _save_state()
 
             for msg in messages:
-                if msg.get("is_bot"):
-                    continue  # ignore bot messages
                 text = msg.get("text", "")
+
+                # Auto-detect tunnel URL from CC's Heartbeat bot (cross-bot sync)
+                if msg.get("is_bot") and text.startswith("[CC_TUNNEL_URL] "):
+                    new_url = text.replace("[CC_TUNNEL_URL] ", "").strip()
+                    if new_url.startswith("https://") and ".trycloudflare.com" in new_url:
+                        global CC_MCP_URL
+                        CC_MCP_URL = new_url
+                        _log(f"CC tunnel URL auto-updated via TG: {new_url}")
+                        _audit("tunnel_url_synced", source="tg_bot", url=new_url)
+                        _tg_send(f"✅ CC tunnel URL synced: <code>{new_url}</code>", html=True)
+                    continue
+
+                if msg.get("is_bot"):
+                    continue  # ignore other bot messages
                 if text.startswith("/"):
                     _handle_tg_command(text, msg.get("from_name", "?"), msg.get("chat_id", 0), msg.get("from_id", 0))
             consecutive_errors = 0
@@ -1418,5 +1430,4 @@ if __name__ == "__main__":
     threading.Thread(target=_tg_poller, daemon=True).start()
     threading.Thread(target=_relay_worker, daemon=True).start()
 
-    bind_host = os.environ.get("GW_BIND_HOST", "0.0.0.0")
-    uvicorn.run(auth_middleware, host=bind_host, port=port)
+    uvicorn.run(auth_middleware, host="127.0.0.1", port=port)
