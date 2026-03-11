@@ -259,6 +259,24 @@ Gateway receives this → OC executes the handoff task → sends TG [RESULT] to 
 
 ---
 
+## Updating
+
+**One command — no manual file reading needed:**
+
+```bash
+./update.sh
+```
+
+This pulls latest, shows what changed, validates .env, restarts Gateway if needed, and runs connectivity tests. Read the output — that's all you need.
+
+- `VERSION` — current protocol version
+- `CHANGELOG.md` — structured release notes
+- `AGENT-MANUAL.md` — this file, the single source of truth for protocol spec
+
+**Do NOT maintain separate copies** of tool lists, URLs, or protocol info. This repo is the canonical source.
+
+---
+
 ## Rules
 1. **External agents → Gateway only** — never expose Worker directly to untrusted agents
 2. **OC → Worker is privileged** — OC is trust_level=owner, auto-approved
