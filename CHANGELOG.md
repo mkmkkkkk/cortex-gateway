@@ -1,5 +1,14 @@
 # Changelog
 
+## [8.0.1] — 2026-03-11
+
+### Fixed — cortex-poll.py Board protocol handling
+- **Bug:** `claude -p` spawned by cron could not load MCP tools (cortex-proxy) — treated Board instructions as "prompt injection" and refused to call `board_claim`/`board_reply`.
+- **Fix:** cortex-poll.py now handles Board protocol (claim + reply) directly via curl. `claude -p` only receives task content and executes it. No MCP dependency for Board interaction.
+- **Root cause:** MCP servers configured in `~/.claude/settings.json` may fail to initialize in cron subprocess environments. The poll script already had HMAC auth + curl infrastructure, so Board protocol belongs there — not in the spawned AI session.
+
+---
+
 ## [8.0.0] — 2026-03-11
 
 ### Added — D58: Protocol Unification + Board Auto-Poll

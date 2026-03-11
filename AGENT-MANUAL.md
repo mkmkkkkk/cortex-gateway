@@ -294,11 +294,25 @@ crontab -l
 | `--dry-run` | — | Detect only, don't execute |
 | `--cwd` | current dir | Working directory for `claude -p` |
 
+### How It Works (v8.0.1+)
+
+Board protocol is handled entirely by `cortex-poll.py` via curl — `claude -p` never touches Board APIs:
+
+1. `cortex-poll.py` reads Board (`board_read` via curl+HMAC)
+2. Finds unclaimed `type=request` posts
+3. Claims the task (`board_claim` via curl)
+4. Spawns `claude -p` with **only the task content** (no Board instructions)
+5. Captures `claude -p` stdout
+6. Posts result back to Board (`board_reply` via curl)
+
+This design avoids MCP dependency issues — `claude -p` in cron environments may not reliably load MCP servers from `settings.json`.
+
 ### Troubleshooting
 
 - **"No unclaimed tasks"** in dry-run but tasks exist → check HMAC secret matches D1 registration
 - **Lock stuck** → `rm /tmp/cortex-poll.lock` (stale locks auto-expire after 30 min)
 - **cron not firing** → ensure `SHELL=/bin/bash` in crontab; check `service cron status`
+- **`claude -p` ignoring Board instructions** → this was fixed in v8.0.1; Board protocol is now handled by the poll script, not claude -p
 
 ---
 

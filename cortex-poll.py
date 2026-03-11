@@ -6,6 +6,10 @@ Checks Cortex Board for unclaimed tasks every invocation.
 Designed to run via cron every 1 minute. Zero AI tokens consumed.
 Only spawns `claude -p` when a real task is found.
 
+Board protocol (claim/reply) is handled HERE via curl — claude -p
+only receives the task content and executes it. This avoids MCP
+dependency issues in cron environments.
+
 Usage:
   # CC (default)
   python3 cortex-poll.py
@@ -31,6 +35,7 @@ import time
 
 WORKER_URL = "https://cortex.mkyang.ai/mcp"
 LOCK_FILE = "/tmp/cortex-poll.lock"
+MAX_RESULT_LEN = 4000  # Truncate claude output for Board reply
 
 
 def _sign(agent_id: str, secret: str, body: bytes) -> dict:
@@ -66,6 +71,29 @@ def _mcp_call(agent_id: str, secret: str, method: str, params: dict, msg_id: int
         return json.loads(r.stdout.decode())
     except (json.JSONDecodeError, UnicodeDecodeError):
         return {}
+
+
+def _board_claim(agent_id: str, secret: str, post_id: str) -> bool:
+    """Claim a Board post. Returns True if successful."""
+    resp = _mcp_call(agent_id, secret, "tools/call", {
+        "name": "board_claim",
+        "arguments": {"post_id": post_id},
+    }, 100)
+    # Check for success (no error in response)
+    return bool(resp.get("result"))
+
+
+def _board_reply(agent_id: str, secret: str, post_id: str, body: str, action: str = "done") -> bool:
+    """Reply to a Board post. Returns True if successful."""
+    resp = _mcp_call(agent_id, secret, "tools/call", {
+        "name": "board_reply",
+        "arguments": {
+            "post_id": post_id,
+            "body": body[:MAX_RESULT_LEN],
+            "action": action,
+        },
+    }, 101)
+    return bool(resp.get("result"))
 
 
 def _extract_posts(resp: dict) -> list:
@@ -134,23 +162,42 @@ def main():
             post_id = task.get("post_id", "")
             title = task.get("title", "")
             body = task.get("body", "")
+            ts = time.strftime("%H:%M:%S")
 
-            prompt = (
-                f"Cortex Board task received.\n"
-                f"Post ID: {post_id}\n"
-                f"Title: {title}\n"
-                f"Body: {body}\n\n"
-                f"Instructions:\n"
-                f"1. Claim this task: board_claim(post_id=\"{post_id}\")\n"
-                f"2. Execute the task\n"
-                f"3. Reply with result: board_reply(post_id=\"{post_id}\", ...)\n"
-            )
+            print(f"[{ts}] Processing: [{post_id}] {title}")
 
-            subprocess.run(
+            # 1. Claim the task via curl (Board protocol handled here)
+            if not _board_claim(args.agent_id, secret, post_id):
+                print(f"[{ts}] Failed to claim {post_id}, skipping")
+                continue
+
+            print(f"[{ts}] Claimed {post_id}, spawning claude -p...")
+
+            # 2. Spawn claude -p with ONLY the task content
+            #    No Board instructions — claude just executes the task.
+            prompt = f"Task: {title}\n\n{body}\n\nExecute this task and provide the result."
+
+            result = subprocess.run(
                 ["claude", "-p", prompt],
+                capture_output=True,
+                text=True,
                 timeout=3600,
                 cwd=args.cwd or os.getcwd(),
             )
+
+            output = (result.stdout or "").strip()
+            if not output:
+                output = f"Task executed (exit code {result.returncode})"
+                if result.stderr:
+                    output += f"\nstderr: {result.stderr[:500]}"
+
+            print(f"[{ts}] claude -p done for {post_id}, posting reply...")
+
+            # 3. Post result back to Board via curl
+            _board_reply(args.agent_id, secret, post_id, output)
+
+            print(f"[{ts}] Done: [{post_id}] {title}")
+
     finally:
         try:
             os.unlink(LOCK_FILE)
