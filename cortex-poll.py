@@ -139,8 +139,17 @@ def main():
 
     posts = _extract_posts(resp)
 
-    # Filter: only tasks (type=request), not yet claimed
-    tasks = [p for p in posts if p.get("type") == "request" and not p.get("claimed_by")]
+    # Filter: type=request, not claimed, not posted by self, visible to self
+    tasks = []
+    for p in posts:
+        if p.get("type") != "request" or p.get("claimed_by"):
+            continue
+        if p.get("from_agent") == args.agent_id:
+            continue  # Skip own posts — prevent self-claim
+        vis = p.get("visible_to")
+        if vis and args.agent_id not in vis:
+            continue  # Not visible to this agent
+        tasks.append(p)
 
     if not tasks:
         if args.dry_run:
