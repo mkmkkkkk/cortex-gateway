@@ -981,13 +981,22 @@ def ping() -> str:
     })
 
 
+def _generate_request_id() -> str:
+    """Auto-generate a unique request ID: req-YYYYMMDD-hex."""
+    d = datetime.now(timezone.utc)
+    date_str = d.strftime("%Y%m%d")
+    rand = secrets.token_hex(4)
+    return f"req-{date_str}-{rand}"
+
+
 @mcp.tool()
 def submit_request(
-    request_id: str,
     request_type: str,
     title: str,
     content: str,
+    request_id: str = "",
     priority: str = "normal",
+    callback_url: str = "",
 ) -> str:
     """Submit a request to the Cortex network.
 
@@ -995,16 +1004,21 @@ def submit_request(
     require CEO approval via Telegram before processing.
 
     Args:
-        request_id: Unique ID (e.g., "req-20260303-001")
         request_type: "research", "file_request", "action", "collaboration"
         title: Short description
         content: Full request details
+        request_id: Optional — auto-generated if omitted
         priority: "normal" or "urgent"
+        callback_url: Optional — Gateway will POST lifecycle events (cc_done, cc_offline, cc_timeout) to this URL
 
     Returns:
-        JSON with status: "accepted", "pending_approval", or "blocked"
+        JSON with status, request_id, will_hold, and message.
     """
     agent_id = _current_agent_id.get()
+
+    # Auto-generate request_id if not provided
+    if not request_id:
+        request_id = _generate_request_id()
 
     # Input validation (H6)
     if not REQUEST_ID_PATTERN.match(request_id):
@@ -1032,6 +1046,7 @@ def submit_request(
         "content": content,
         "priority": priority,
         "agent_id": agent_id,
+        "callback_url": callback_url,
         "submitted_at": _now(),
     }
 
@@ -1042,6 +1057,7 @@ def submit_request(
         with _state_lock:
             _state["requests"][request_id] = {
                 "status": "blocked", "trigger": trigger, "agent_id": agent_id,
+                "callback_url": callback_url,
             }
             _prune_state()
             _save_state()
@@ -1051,7 +1067,7 @@ def submit_request(
             f"Trigger: {_tg_escape(trigger)}\n"
             f"Content: {_tg_escape(content[:200])}"
         )
-        return json.dumps({"status": "blocked", "reason": "Content blocked by policy"})
+        return json.dumps({"status": "blocked", "request_id": request_id, "will_hold": False, "reason": "Content blocked by policy"})
 
     if action == "hold":
         with _state_lock:
@@ -1068,6 +1084,7 @@ def submit_request(
                 "status": "pending_approval",
                 "approval_id": approval_id,
                 "agent_id": agent_id,
+                "callback_url": callback_url,
             }
             _prune_state()
             _save_state()
@@ -1083,19 +1100,24 @@ def submit_request(
         )
         return json.dumps({
             "status": "pending_approval",
+            "request_id": request_id,
             "approval_id": approval_id,
+            "will_hold": True,
+            "trigger": trigger,
             "message": "Request held for CEO approval.",
         })
 
     # action == "allow" — auto-approve, add to relay queue
     with _state_lock:
         _state["relay_queue"].append(request_data)
-        _state["requests"][request_id] = {"status": "approved", "agent_id": agent_id}
+        _state["requests"][request_id] = {"status": "approved", "agent_id": agent_id, "callback_url": callback_url}
         _prune_state()
         _save_state()
 
     return json.dumps({
         "status": "accepted",
+        "request_id": request_id,
+        "will_hold": False,
         "message": "Request approved, relaying to CC.",
     })
 
@@ -1254,11 +1276,33 @@ _LIFECYCLE_CHECK_INTERVAL = 60        # check every 60s
 _lifecycle_alerted: set[str] = set()  # track tasks we've already alerted on
 
 
+def _push_lifecycle_callback(req_id: str, info: dict, event: str, details: dict):
+    """POST lifecycle event to agent's callback_url if configured."""
+    cb_url = info.get("callback_url", "")
+    if not cb_url:
+        return
+    payload = json.dumps({
+        "request_id": req_id,
+        "event": event,
+        "status": info.get("status", ""),
+        **details,
+        "ts": _now(),
+    }).encode()
+    try:
+        req = Request(cb_url, data=payload, method="POST",
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=10) as resp:
+            _log(f"Lifecycle callback sent: {req_id} → {event} ({resp.status})")
+    except Exception as e:
+        _log(f"Lifecycle callback failed: {req_id} → {event}: {e}")
+
+
 def _task_lifecycle_worker():
     """Background thread: detect stale tasks and escalate.
 
     Scans all 'relayed' tasks. If CC hasn't picked up (pending > 2min)
-    or is stuck (processing > 60min), alerts CEO via TG and updates state.
+    or is stuck (processing > 60min), alerts CEO via TG, pushes callback
+    to agent, and updates state.
     OC just reads check_status — no timeout logic needed on OC side.
     """
     _log("Task lifecycle worker started")
@@ -1308,6 +1352,10 @@ def _task_lifecycle_worker():
                         _save_state()
                 _log(f"Lifecycle: {req_id} completed (caught via poll, status={w_status})")
                 _lifecycle_alerted.add(req_id)
+                _push_lifecycle_callback(req_id, info, f"cc_{w_status}", {
+                    "result": worker_status.get("result"),
+                    "message": "Task completed by CC.",
+                })
                 continue
 
             if w_status == "pending" and age_sec > _LIFECYCLE_PENDING_TIMEOUT:
@@ -1325,6 +1373,10 @@ def _task_lifecycle_worker():
                     f"Task pending {int(age_sec)}s — CC not polling.\n"
                     f"Task: {_tg_escape(info.get('title', '?')[:100])}"
                 )
+                _push_lifecycle_callback(req_id, info, "cc_offline", {
+                    "age_sec": int(age_sec),
+                    "message": "CC is offline — task was not picked up.",
+                })
                 continue
 
             if w_status == "processing":
@@ -1352,12 +1404,63 @@ def _task_lifecycle_worker():
                         f"Processing {int(proc_sec // 60)}min — CC may be stuck.\n"
                         f"Task: {_tg_escape(info.get('title', '?')[:100])}"
                     )
+                    _push_lifecycle_callback(req_id, info, "cc_timeout", {
+                        "proc_sec": int(proc_sec),
+                        "message": "CC started but did not finish in time.",
+                    })
 
 
 def _dns_url_sync():
     """DEPRECATED: Tunnel DNS sync no longer needed — Cortex Worker is at cortex.mkyang.ai."""
     _log("DNS URL sync disabled — using permanent Worker URL: https://cortex.mkyang.ai/mcp")
     return
+
+
+# ── Startup Env Validation (D44) ─────────────────────────────────
+
+_REQUIRED_ENV = {
+    "CORTEX_TG_BOT_TOKEN": "Telegram bot token (CEO alerts, approval flow)",
+    "CORTEX_TG_CHAT_ID": "Telegram chat ID (where alerts are sent)",
+    "CORTEX_HMAC_SECRET_OC": "HMAC secret for Gateway→Worker auth",
+    "GW_CALLBACK_SECRET": "Shared secret for CC→Gateway callback auth",
+}
+
+_RECOMMENDED_ENV = {
+    "CORTEX_TG_CEO_USER_ID": "CEO TG user ID (per-user auth for /approve commands)",
+    "GW_CALLBACK_URL": "Gateway callback URL (for CC to POST results back)",
+}
+
+
+def _validate_env():
+    """Validate required environment variables at startup. Exit(1) if critical vars missing."""
+    missing = []
+    for var, desc in _REQUIRED_ENV.items():
+        if not os.environ.get(var, ""):
+            missing.append(f"  {var} — {desc}")
+
+    if missing:
+        _log("FATAL: Missing required environment variables:")
+        for m in missing:
+            _log(m)
+        _log("Copy .env.example to .env and fill in values: cp .env.example .env")
+        sys.exit(1)
+
+    # Warn about recommended but non-critical vars
+    for var, desc in _RECOMMENDED_ENV.items():
+        if not os.environ.get(var, ""):
+            _log(f"WARNING: {var} not set — {desc}")
+
+    # Validate at least one agent has HMAC secret configured
+    registry = _load_registry()
+    agents = registry.get("agents", {})
+    if not agents:
+        _log("FATAL: No agents in agent-registry.json")
+        sys.exit(1)
+
+    for agent_id, agent_conf in agents.items():
+        secret_env = agent_conf.get("hmac_secret_env", "")
+        if secret_env and not os.environ.get(secret_env, ""):
+            _log(f"WARNING: Agent '{agent_id}' references {secret_env} but it's not set")
 
 
 # ── Entry Point ───────────────────────────────────────────────────
@@ -1370,6 +1473,8 @@ if __name__ == "__main__":
     if "--port" in sys.argv:
         idx = sys.argv.index("--port")
         port = int(sys.argv[idx + 1])
+
+    _validate_env()
 
     registry = _load_registry()
     agent_count = len(registry.get("agents", {}))

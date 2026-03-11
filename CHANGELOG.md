@@ -1,5 +1,21 @@
 # Changelog
 
+## [7.2.0] — 2026-03-11
+
+### Added — D55: Agent Cognitive Load Minimization
+- **`request_id` auto-generation** — `submit_request` `request_id` param now optional; server generates `req-YYYYMMDD-hex`.
+- **`will_hold` in response** — all `submit_request` responses include `will_hold` (bool) and `request_id`.
+- **Lifecycle callback** — new `callback_url` param on `submit_request`; Gateway POSTs on `cc_offline`/`cc_timeout`/`cc_done`.
+- **`mcp_client.py`** — canonical Python client with HMAC signing + MCP handshake. Drop-in library for any agent.
+- **Startup env validation** — `_validate_env()` checks required vars at boot; exit(1) if missing (D44 implemented).
+
+### Migration
+- No breaking changes. `request_id` is now optional (was already generated client-side).
+- New file: `mcp_client.py` — optional client library.
+- `./update.sh` to apply.
+
+---
+
 ## [7.1.0] — 2026-03-11
 
 ### Added
