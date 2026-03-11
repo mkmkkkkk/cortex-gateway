@@ -134,29 +134,38 @@ fi
 # ── 6. Board Auto-Poll (cron) ────────────────────────────────────
 echo -e "${CYAN}[5/6] Checking Board auto-poll cron...${NC}"
 
-# Detect AI CLI (claude, happy, or openclaw)
-AI_CLI=""
-for cli_candidate in claude happy openclaw; do
-    if command -v "$cli_candidate" &>/dev/null; then
-        AI_CLI="$cli_candidate"
-        break
-    fi
-done
+# Detect execution backend: webhook (OpenClaw) > CLI (claude/happy)
+POLL_MODE=""
+POLL_ARGS=""
+if curl -s -o /dev/null -w "%{http_code}" http://localhost:18789/hooks/agent 2>/dev/null | grep -qE "^(401|403|405|200)"; then
+    POLL_MODE="webhook"
+    POLL_ARGS="--mode webhook --webhook-url http://localhost:18789/hooks/agent --webhook-token-env OC_WEBHOOK_TOKEN"
+    echo "  Detected: OpenClaw webhook (localhost:18789)"
+else
+    for cli_candidate in claude happy; do
+        if command -v "$cli_candidate" &>/dev/null; then
+            POLL_MODE="cli"
+            POLL_ARGS="--mode cli --cli ${cli_candidate}"
+            echo "  Detected: AI CLI ($cli_candidate)"
+            break
+        fi
+    done
+fi
 
 POLL_INSTALLED=false
 if crontab -l 2>/dev/null | grep -q "cortex-poll"; then
     POLL_INSTALLED=true
     echo -e "${GREEN}  cortex-poll cron: already installed${NC}"
-elif [ -z "$AI_CLI" ]; then
-    echo -e "${YELLOW}  No AI CLI found (claude/happy/openclaw) — cannot install auto-poll${NC}"
-    echo "  Install one, then re-run ./update.sh"
+elif [ -z "$POLL_MODE" ]; then
+    echo -e "${YELLOW}  No AI backend found (OpenClaw webhook / claude / happy)${NC}"
+    echo "  Start OpenClaw or install claude CLI, then re-run ./update.sh"
 else
-    echo "  Installing cortex-poll cron (every minute, cli=$AI_CLI)..."
-    CRON_LINE="* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC --cli ${AI_CLI} >> /tmp/cortex-poll.log 2>&1"
+    echo "  Installing cortex-poll cron (every minute, mode=$POLL_MODE)..."
+    CRON_LINE="* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC ${POLL_ARGS} >> /tmp/cortex-poll.log 2>&1"
     (crontab -l 2>/dev/null | grep -v "cortex-poll"; echo "SHELL=/bin/bash"; echo "$CRON_LINE") | crontab -
     if crontab -l 2>/dev/null | grep -q "cortex-poll"; then
         POLL_INSTALLED=true
-        echo -e "${GREEN}  cortex-poll cron: installed OK (cli=$AI_CLI)${NC}"
+        echo -e "${GREEN}  cortex-poll cron: installed OK (mode=$POLL_MODE)${NC}"
     else
         echo -e "${RED}  cortex-poll cron: install failed${NC}"
     fi

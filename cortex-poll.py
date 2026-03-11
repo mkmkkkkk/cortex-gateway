@@ -4,24 +4,27 @@ cortex-poll — Zero-token Board poller.
 
 Checks Cortex Board for unclaimed tasks every invocation.
 Designed to run via cron every 1 minute. Zero AI tokens consumed.
-Only spawns `claude -p` when a real task is found.
+Only dispatches to AI when a real task is found.
 
-Board protocol (claim/reply) is handled HERE via curl — claude -p
-only receives the task content and executes it. This avoids MCP
-dependency issues in cron environments.
+Board protocol (claim/reply) is handled HERE via curl.
+AI execution backend is configurable:
+  --mode cli      → spawns `claude -p` (or --cli <cmd>)
+  --mode webhook  → POSTs to OpenClaw /hooks/agent endpoint
 
 Usage:
-  # CC (default)
+  # CC — CLI mode (default)
   python3 cortex-poll.py
 
-  # OC
-  python3 cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC
+  # OC — Webhook mode (OpenClaw)
+  python3 cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC \\
+      --mode webhook --webhook-url http://localhost:18789/hooks/agent \\
+      --webhook-token-env OC_WEBHOOK_TOKEN
 
-  # Dry run (detect only, no claude -p)
+  # Dry run
   python3 cortex-poll.py --dry-run
 
   # Cron (every minute)
-  * * * * * . /path/to/.env && python3 cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC >> /tmp/cortex-poll.log 2>&1
+  * * * * * . /path/to/.env && python3 cortex-poll.py [args] >> /tmp/cortex-poll.log 2>&1
 """
 
 import argparse
@@ -35,7 +38,7 @@ import time
 
 WORKER_URL = "https://cortex.mkyang.ai/mcp"
 LOCK_FILE = "/tmp/cortex-poll.lock"
-MAX_RESULT_LEN = 4000  # Truncate claude output for Board reply
+MAX_RESULT_LEN = 4000  # Truncate output for Board reply
 
 
 def _sign(agent_id: str, secret: str, body: bytes) -> dict:
@@ -79,7 +82,6 @@ def _board_claim(agent_id: str, secret: str, post_id: str) -> bool:
         "name": "board_claim",
         "arguments": {"post_id": post_id},
     }, 100)
-    # Check for success (no error in response)
     return bool(resp.get("result"))
 
 
@@ -108,15 +110,73 @@ def _extract_posts(resp: dict) -> list:
         return []
 
 
+# ── Execution backends ──────────────────────────────────────────
+
+
+def _exec_cli(prompt: str, cli: str, cwd: str) -> str:
+    """Execute via AI CLI (claude -p, happy -p, etc.)."""
+    result = subprocess.run(
+        [cli, "-p", prompt],
+        capture_output=True,
+        text=True,
+        timeout=3600,
+        cwd=cwd,
+    )
+    output = (result.stdout or "").strip()
+    if not output:
+        output = f"Task executed (exit code {result.returncode})"
+        if result.stderr:
+            output += f"\nstderr: {result.stderr[:500]}"
+    return output
+
+
+def _exec_webhook(prompt: str, webhook_url: str, webhook_token: str) -> str:
+    """Execute via OpenClaw webhook (POST /hooks/agent)."""
+    payload = json.dumps({"message": prompt}).encode()
+    cmd = [
+        "curl", "-s", "-X", "POST", webhook_url,
+        "--max-time", "300",
+        "-H", f"Authorization: Bearer {webhook_token}",
+        "-H", "Content-Type: application/json",
+        "-d", "@-",
+    ]
+    r = subprocess.run(cmd, input=payload, capture_output=True, timeout=600)
+    if r.returncode != 0:
+        return f"Webhook call failed (exit code {r.returncode})\nstderr: {(r.stderr or b'').decode()[:500]}"
+    body = (r.stdout or b"").decode().strip()
+    if not body:
+        return "Webhook returned empty response — task may be processing async"
+    # Try to extract message from JSON response
+    try:
+        data = json.loads(body)
+        return data.get("message") or data.get("result") or data.get("text") or json.dumps(data)
+    except (json.JSONDecodeError, ValueError):
+        return body
+
+
+# ── Main ────────────────────────────────────────────────────────
+
+
 def main():
     parser = argparse.ArgumentParser(description="Cortex Board poller")
     parser.add_argument("--agent-id", default="cc", help="Agent ID (default: cc)")
     parser.add_argument("--secret-env", default="CORTEX_HMAC_SECRET_CC",
                         help="Env var name for HMAC secret (default: CORTEX_HMAC_SECRET_CC)")
     parser.add_argument("--dry-run", action="store_true", help="Detect only, don't execute")
+
+    # Execution backend
+    parser.add_argument("--mode", choices=["cli", "webhook"], default="cli",
+                        help="Execution mode: cli (spawn AI CLI) or webhook (POST to endpoint)")
+    # CLI mode args
     parser.add_argument("--cli", default="claude",
-                        help="AI CLI command (default: claude). E.g.: claude, happy, openclaw")
+                        help="AI CLI command for cli mode (default: claude)")
     parser.add_argument("--cwd", default=None, help="Working directory for AI CLI")
+    # Webhook mode args
+    parser.add_argument("--webhook-url", default="http://localhost:18789/hooks/agent",
+                        help="Webhook URL for webhook mode (default: OpenClaw local)")
+    parser.add_argument("--webhook-token-env", default="OC_WEBHOOK_TOKEN",
+                        help="Env var for webhook auth token (default: OC_WEBHOOK_TOKEN)")
+
     args = parser.parse_args()
 
     secret = os.environ.get(args.secret_env, "")
@@ -124,7 +184,13 @@ def main():
         print(f"{args.secret_env} not set", file=sys.stderr)
         sys.exit(1)
 
-    # Lock: prevent overlapping runs (if claude -p takes > 1 min)
+    if args.mode == "webhook":
+        webhook_token = os.environ.get(args.webhook_token_env, "")
+        if not webhook_token:
+            print(f"{args.webhook_token_env} not set", file=sys.stderr)
+            sys.exit(1)
+
+    # Lock: prevent overlapping runs
     if not args.dry_run and os.path.exists(LOCK_FILE):
         try:
             age = time.time() - os.path.getmtime(LOCK_FILE)
@@ -182,27 +248,17 @@ def main():
                 print(f"[{ts}] Failed to claim {post_id}, skipping")
                 continue
 
-            print(f"[{ts}] Claimed {post_id}, spawning {args.cli} -p...")
-
-            # 2. Spawn AI CLI with ONLY the task content
-            #    No Board instructions — AI just executes the task.
+            # 2. Execute via chosen backend
             prompt = f"Task: {title}\n\n{body}\n\nExecute this task and provide the result."
 
-            result = subprocess.run(
-                [args.cli, "-p", prompt],
-                capture_output=True,
-                text=True,
-                timeout=3600,
-                cwd=args.cwd or os.getcwd(),
-            )
+            if args.mode == "webhook":
+                print(f"[{ts}] Claimed {post_id}, POSTing to webhook...")
+                output = _exec_webhook(prompt, args.webhook_url, webhook_token)
+            else:
+                print(f"[{ts}] Claimed {post_id}, spawning {args.cli} -p...")
+                output = _exec_cli(prompt, args.cli, args.cwd or os.getcwd())
 
-            output = (result.stdout or "").strip()
-            if not output:
-                output = f"Task executed (exit code {result.returncode})"
-                if result.stderr:
-                    output += f"\nstderr: {result.stderr[:500]}"
-
-            print(f"[{ts}] claude -p done for {post_id}, posting reply...")
+            print(f"[{ts}] Execution done for {post_id}, posting reply...")
 
             # 3. Post result back to Board via curl
             _board_reply(args.agent_id, secret, post_id, output)
