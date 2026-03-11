@@ -1,6 +1,6 @@
 {
   "block_keywords": [".env", "secret", "password", "credential", "token", "private_key", "api_key", "hmac_secret", "bearer_token", "/etc/passwd", "/etc/shadow", ".ssh", "id_rsa", "id_ed25519", "authorized_keys"],
-  "hold_keywords": ["file", "文件", "data", "数据", "code", "代码", "deploy", "部署", "config", "配置", "send", "email", "push", ".."],
+  "hold_keywords": ["deploy", "部署", "send email", "发邮件", "git push", "publish", "发布"],
   "block_paths": ["/workspace/.env", "~/.claude/", "credentials.md", "agent-registry.json", "*.pem", "*.key"],
-  "auto_allow_types": ["research"]
+  "auto_allow_types": ["research", "action", "monitor"]
 }

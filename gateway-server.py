@@ -30,14 +30,16 @@ import html as html_mod
 import json
 import os
 import re
+import secrets
 import sys
 import tempfile
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import parse_qs
 from urllib.request import Request, urlopen
 
 # ── Paths ─────────────────────────────────────────────────────────
@@ -80,8 +82,13 @@ _load_env()
 TG_BOT_TOKEN = os.environ.get("CORTEX_TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("CORTEX_TG_CHAT_ID", "")
 TG_CEO_USER_ID = os.environ.get("CORTEX_TG_CEO_USER_ID", "")  # CEO's TG user_id for per-user auth
-CC_MCP_URL = os.environ.get("CC_MCP_URL", "")  # CC's Cloudflare Tunnel endpoint
+CC_MCP_URL = os.environ.get("CC_MCP_URL", "https://cortex.mkyang.ai/mcp")  # Cortex Worker (Cloudflare, permanent)
+CC_TUNNEL_SECRET = os.environ.get("CC_TUNNEL_SECRET", "")  # DEPRECATED: was for tunnel URL encryption
+DNS_TUNNEL_RECORD = os.environ.get("DNS_TUNNEL_RECORD", "_cortex.mkyang.ai")  # DEPRECATED: was for DNS URL sync
 CC_HMAC_SECRET = os.environ.get("CORTEX_HMAC_SECRET_OC", "")  # Gateway → CC auth
+GW_CALLBACK_SECRET = os.environ.get("GW_CALLBACK_SECRET", "")  # CC → Gateway callback auth
+GW_CALLBACK_URL = os.environ.get("GW_CALLBACK_URL", "")  # Gateway's own callback URL (e.g., http://localhost:8750/callback)
+GW_PUBLIC_URL = os.environ.get("GW_PUBLIC_URL", "")  # Public-facing URL for onboard links (e.g., https://gateway.example.com)
 HMAC_WINDOW_SEC = 60  # 60s replay window (H4: tightened from 300s)
 DEFAULT_RATE_LIMIT = 10
 RATE_WINDOW_SEC = 60
@@ -90,6 +97,22 @@ MAX_STATE_REQUESTS = 10_000  # prune old entries beyond this (H3)
 VALID_REQUEST_TYPES = {"research", "file_request", "action", "collaboration"}
 VALID_PRIORITIES = {"normal", "urgent"}
 REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")  # H6: strict format
+ONBOARD_RATE_LIMIT = 5  # max onboard attempts per minute
+INVITE_DEFAULT_HOURS = 24
+
+# ── Auto-ban system (ported from cortex-mcp-server.py) ───────────
+AUTH_FAIL_WINDOW = 600  # 10 minutes
+AUTH_FAIL_THRESHOLD = 10  # failures before ban
+AUTO_BAN_DURATION = 3600  # 1 hour ban
+_auth_failures: dict[str, list[float]] = defaultdict(list)
+_auto_bans: dict[str, float] = {}  # ip -> ban_expiry_timestamp
+VALID_ROLES = {"full", "research", "readonly"}
+VALID_TRUST_LEVELS = {"owner", "team", "restricted", "blocked"}
+ROLE_TOOLS = {
+    "full": ["submit_request", "check_status", "ping"],
+    "research": ["submit_request", "check_status", "ping"],
+    "readonly": ["check_status", "ping"],
+}
 
 
 # ── Logging ───────────────────────────────────────────────────────
@@ -119,6 +142,7 @@ _state = {
     "pending_approvals": {},  # str(id) -> {request_data, agent_id, trigger, created_at}
     "relay_queue": [],        # approved tasks waiting to send to CC
     "requests": {},           # request_id -> {status, agent_id, ...}
+    "invites": {},            # token -> {agent_id, role, trust_level, expires_at, status, ...}
     "next_id": 1,
     "tg_offset": 0,
 }
@@ -290,7 +314,15 @@ def check_trust(agent_id: str, content: str, request_type: str) -> tuple[str, st
     if trust == "blocked":
         return "block", "agent_blocked"
     if trust == "owner":
-        return "allow", ""  # owner bypasses all checks
+        # T3 fix: owner still runs block_keywords scan (defense-in-depth).
+        # A compromised owner identity or supply chain attack should not
+        # bypass critical keyword blocking (e.g., secret exfiltration).
+        action, trigger = scan_sensitivity(content, request_type)
+        if action == "block":
+            _log(f"SECURITY: Owner request blocked by keyword: {trigger}")
+            _audit("owner_blocked", agent_id=agent_id, trigger=trigger)
+            return "block", trigger
+        return "allow", ""  # owner skips hold (auto-approve) but not block
     if trust == "restricted":
         return "hold", "restricted_agent"
 
@@ -371,8 +403,13 @@ def _handle_tg_command(text: str, from_name: str, chat_id: int = 0, from_id: int
         _audit("tg_unauthorized", chat_id=chat_id, from_name=from_name, text=text[:50])
         _log(f"[TG-AUTH] Unauthorized chat_id={chat_id}, from={from_name}")
         return  # silently ignore
+    # T3 fix: fail-closed — if CEO user_id not configured, deny all commands
+    if not TG_CEO_USER_ID:
+        _log(f"SECURITY: TG command rejected — CORTEX_TG_CEO_USER_ID not configured (fail-closed)")
+        _tg_send("Gateway commands disabled: CEO user_id not configured.")
+        return
     # Per-user auth: only CEO can run commands (not just any group member)
-    if TG_CEO_USER_ID and str(from_id) != str(TG_CEO_USER_ID):
+    if str(from_id) != str(TG_CEO_USER_ID):
         _audit("tg_unauthorized_user", chat_id=chat_id, from_id=from_id, from_name=from_name, text=text[:50])
         _log(f"[TG-AUTH] Non-CEO user {from_name}(id={from_id}) tried: {text[:30]}")
         _tg_send(f"Unauthorized: only CEO can run gateway commands.")
@@ -469,6 +506,85 @@ def _handle_tg_command(text: str, from_name: str, chat_id: int = 0, from_id: int
                 lines.append(f"  <code>{aid}</code>: {trust} ({status})")
             _tg_send("\n".join(lines))
 
+    elif cmd == "/invite" and arg:
+        # Parse optional flags: --role, --trust, --expires
+        role, trust, expires_h = "research", "team", INVITE_DEFAULT_HOURS
+        i = 2
+        while i < len(parts):
+            if parts[i] == "--role" and i + 1 < len(parts):
+                role = parts[i + 1]
+                i += 2
+            elif parts[i] == "--trust" and i + 1 < len(parts):
+                trust = parts[i + 1]
+                i += 2
+            elif parts[i] == "--expires" and i + 1 < len(parts):
+                try:
+                    expires_h = int(parts[i + 1])
+                except ValueError:
+                    pass
+                i += 2
+            else:
+                i += 1
+
+        if role not in VALID_ROLES:
+            _tg_send(f"Invalid role '{role}'. Valid: {', '.join(sorted(VALID_ROLES))}")
+            return
+        if trust not in VALID_TRUST_LEVELS or trust == "blocked":
+            _tg_send(f"Invalid trust '{trust}'. Valid: owner, team, restricted")
+            return
+
+        # Check if agent already exists
+        registry = _load_registry()
+        if arg in registry.get("agents", {}):
+            existing = registry["agents"][arg]
+            if existing.get("status") != "revoked":
+                _tg_send(f"Agent '{_tg_escape(arg)}' already registered. Revoke first or use a different ID.")
+                return
+
+        token = _create_invite(arg, role=role, trust=trust, expires_hours=expires_h, created_by=from_name)
+        base_url = GW_PUBLIC_URL.rstrip("/") if GW_PUBLIC_URL else "http://&lt;gateway&gt;"
+        onboard_url = f"{base_url}/onboard?token={token}"
+
+        _tg_send(
+            f"<b>[INVITE]</b> {_tg_escape(arg)}\n"
+            f"Role: {role} | Trust: {trust}\n"
+            f"Expires: {expires_h}h\n\n"
+            f"Onboard URL:\n<code>{onboard_url}</code>\n\n"
+            f"Send to the agent operator. Agent visits URL → auto-connected."
+        )
+        _audit("invite_sent", agent_id=arg, role=role, trust=trust, by=from_name)
+
+    elif cmd == "/invites":
+        invites = _state.get("invites", {})
+        pending = {k: v for k, v in invites.items() if v.get("status") == "pending"}
+        if not pending:
+            _tg_send("No pending invites")
+        else:
+            lines = ["<b>Pending Invites:</b>"]
+            for token, info in pending.items():
+                expires = info.get("expires_at", "?")[:16]
+                lines.append(
+                    f"\n{_tg_escape(info.get('agent_id', '?'))}"
+                    f" | {info.get('role', '?')} | {info.get('trust_level', '?')}"
+                    f"\nExpires: {expires}"
+                    f"\nToken: <code>{token[:12]}...</code>"
+                )
+            _tg_send("\n".join(lines))
+
+    elif cmd == "/revoke-invite" and arg:
+        # Match by token prefix
+        invites = _state.get("invites", {})
+        matched = [k for k in invites if k.startswith(arg) and invites[k].get("status") == "pending"]
+        if not matched:
+            _tg_send(f"No pending invite matching '{_tg_escape(arg)}'")
+        else:
+            for k in matched:
+                invites[k]["status"] = "revoked"
+            with _state_lock:
+                _save_state()
+            _tg_send(f"Revoked {len(matched)} invite(s)")
+            _audit("invite_revoked", prefix=arg, count=len(matched), by=from_name)
+
     elif cmd == "/help":
         _tg_send(
             "<b>Gateway Commands:</b>\n"
@@ -477,8 +593,208 @@ def _handle_tg_command(text: str, from_name: str, chat_id: int = 0, from_id: int
             "/flag &lt;agent&gt; — Block agent\n"
             "/unblock &lt;agent&gt; — Restore to team\n"
             "/pending — List pending\n"
-            "/agents — List agents"
+            "/agents — List agents\n"
+            "/invite &lt;id&gt; [--role R] [--trust T] — Create invite\n"
+            "/invites — List pending invites\n"
+            "/revoke-invite &lt;prefix&gt; — Revoke invite"
         )
+
+
+# ── CC Callback Handler ───────────────────────────────────────────
+
+def _handle_cc_callback(body: bytes, client_ip: str) -> tuple[dict, int]:
+    """Handle callback POST from CC with task results.
+
+    Returns (response_dict, status_code).
+    CC posts: {task_id, status, result, completed_at, assign_oc?}
+    """
+    # Auth: verify shared secret in X-Callback-Secret header
+    # (simplified auth — CC and Gateway share GW_CALLBACK_SECRET)
+    # Full HMAC not needed here because this endpoint is not exposed externally.
+
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return {"error": "Invalid JSON"}, 400
+
+    task_id = payload.get("task_id", "")
+    status = payload.get("status", "unknown")
+    result = payload.get("result", {})
+    assign_oc = payload.get("assign_oc")
+
+    if not task_id:
+        return {"error": "Missing task_id"}, 400
+
+    _log(f"Callback received: task={task_id} status={status}")
+    _audit("callback_received", task_id=task_id, status=status, ip=client_ip)
+
+    # Update request state if we have it
+    with _state_lock:
+        # Find the request_id that maps to this task_id
+        for req_id, req_info in _state.get("requests", {}).items():
+            if req_id == task_id or req_info.get("task_id") == task_id:
+                req_info["status"] = f"cc_{status}"
+                req_info["cc_result"] = result
+                req_info["completed_at"] = _now()
+                _save_state()
+                break
+
+    # Send TG [RESULT] to CEO — Gateway is the single point of contact
+    summary = ""
+    if isinstance(result, dict):
+        summary = result.get("summary", result.get("message", str(result)[:300]))
+    elif isinstance(result, str):
+        summary = result[:300]
+    else:
+        summary = str(result)[:300]
+
+    tg_msg = (
+        f"<b>[RESULT] {task_id}</b>\n"
+        f"Status: {status}\n"
+        f"{summary}"
+    )
+    _tg_send(tg_msg)
+
+    # Handle assign_oc handoff if present
+    if assign_oc and isinstance(assign_oc, dict):
+        oc_type = assign_oc.get("type", "unknown")
+        oc_title = assign_oc.get("title", "")
+        _log(f"CC requests OC handoff: type={oc_type} title={oc_title}")
+        _tg_send(
+            f"<b>[ASSIGN-OC]</b> {oc_title}\n"
+            f"Type: {oc_type}\n"
+            f"From task: {task_id}"
+        )
+        # OC picks this up from TG and handles it
+
+    return {"status": "ok", "task_id": task_id}, 200
+
+
+# ── Agent Onboarding ─────────────────────────────────────────────
+
+def _create_invite(agent_id: str, role: str = "research", trust: str = "team",
+                   expires_hours: int = INVITE_DEFAULT_HOURS, created_by: str = "CEO") -> str:
+    """Create an invite token for a new agent. Returns the token."""
+    token = "inv_" + secrets.token_hex(32)
+    now = datetime.now(timezone.utc)
+    with _state_lock:
+        if "invites" not in _state:
+            _state["invites"] = {}
+        _state["invites"][token] = {
+            "agent_id": agent_id,
+            "role": role,
+            "trust_level": trust,
+            "created_at": now.isoformat(),
+            "expires_at": (now + timedelta(hours=expires_hours)).isoformat(),
+            "created_by": created_by,
+            "status": "pending",
+            "used_at": None,
+            "used_from_ip": None,
+        }
+        _save_state()
+    _audit("invite_created", agent_id=agent_id, role=role, trust=trust, expires_hours=expires_hours)
+    return token
+
+
+def _handle_onboard(query_string: str, client_ip: str) -> tuple[dict, int]:
+    """Handle GET /onboard?token=inv_xxx — provision a new agent."""
+    params = parse_qs(query_string)
+    token = params.get("token", [""])[0]
+
+    if not token:
+        return {"error": "Missing token parameter"}, 400
+
+    with _state_lock:
+        invites = _state.get("invites", {})
+        invite = invites.get(token)
+
+        if not invite:
+            return {"error": "Invalid or expired token"}, 404
+
+        # Check expiry
+        expires_at = datetime.fromisoformat(invite["expires_at"])
+        if datetime.now(timezone.utc) > expires_at:
+            invite["status"] = "expired"
+            _save_state()
+            return {"error": "Token expired"}, 404
+
+        # Check already used
+        if invite["status"] == "used":
+            return {"error": "Token already used"}, 410
+
+        agent_id = invite["agent_id"]
+
+        # Check if agent_id already exists in registry
+        registry = _load_registry()
+        if agent_id in registry.get("agents", {}):
+            existing = registry["agents"][agent_id]
+            if existing.get("status") != "revoked":
+                return {"error": f"Agent '{agent_id}' already registered"}, 409
+
+        # Generate HMAC secret
+        hmac_secret = secrets.token_hex(32)
+        env_key = f"GW_HMAC_{agent_id.upper().replace('-', '_')}"
+
+        # Write to registry
+        with _registry_lock:
+            registry = _load_registry()
+            registry["agents"][agent_id] = {
+                "name": agent_id,
+                "owner": invite.get("created_by", "CEO"),
+                "role": invite["role"],
+                "trust_level": invite["trust_level"],
+                "hmac_secret_env": env_key,
+                "rate_limit": DEFAULT_RATE_LIMIT,
+                "status": "active",
+                "created_at": _now(),
+                "onboarded_from_ip": client_ip,
+            }
+            _save_registry(registry)
+
+        # Set env var in running process (hot reload — no restart needed)
+        os.environ[env_key] = hmac_secret
+
+        # Also append to .env file for persistence across restarts
+        env_file = SCRIPT_DIR / ".env"
+        try:
+            with open(env_file, "a") as f:
+                f.write(f"{env_key}={hmac_secret}\n")
+        except Exception as e:
+            _log(f"WARNING: Failed to write {env_key} to .env: {e}")
+
+        # Mark invite as used
+        invite["status"] = "used"
+        invite["used_at"] = _now()
+        invite["used_from_ip"] = client_ip
+        _save_state()
+
+    _audit("agent_onboarded", agent_id=agent_id, ip=client_ip, role=invite["role"], trust=invite["trust_level"])
+    _log(f"Agent '{agent_id}' onboarded from {client_ip}")
+
+    # TG notification
+    _tg_send(
+        f"<b>[ONBOARD]</b> {_tg_escape(agent_id)}\n"
+        f"Role: {_tg_escape(invite['role'])} | Trust: {_tg_escape(invite['trust_level'])}\n"
+        f"IP: {_tg_escape(client_ip)}"
+    )
+
+    # Build gateway URL for the response
+    gateway_url = GW_PUBLIC_URL.rstrip("/") + "/mcp" if GW_PUBLIC_URL else "http://<gateway-host>:8750/mcp"
+
+    return {
+        "status": "ok",
+        "agent_id": agent_id,
+        "hmac_secret": hmac_secret,
+        "gateway_url": gateway_url,
+        "trust_level": invite["trust_level"],
+        "role": invite["role"],
+        "instructions": (
+            "Use HMAC-SHA256 to sign every request. "
+            "Headers: X-CC-Agent-ID (your agent_id), "
+            "X-CC-Timestamp (unix seconds), "
+            "X-CC-Signature (HMAC-SHA256 of '{timestamp}.{body}' using hmac_secret)"
+        ),
+    }, 200
 
 
 # ── CC Relay ──────────────────────────────────────────────────────
@@ -538,19 +854,23 @@ def relay_to_cc(task_data: dict) -> dict:
             session_id=session_id,
         )
 
-        # Step 3: Call submit_task
+        # Step 3: Call submit_task with callback_url so CC posts results back
+        submit_args = {
+            "task_id": task_data.get("request_id", ""),
+            "task_type": task_data.get("request_type", "research"),
+            "title": task_data.get("title", ""),
+            "context": task_data.get("content", ""),
+            "priority": task_data.get("priority", "normal"),
+        }
+        if GW_CALLBACK_URL:
+            submit_args["callback_url"] = GW_CALLBACK_URL
+
         result, _ = _cc_mcp_request({
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
                 "name": "submit_task",
-                "arguments": {
-                    "task_id": task_data.get("request_id", ""),
-                    "task_type": task_data.get("request_type", "research"),
-                    "title": task_data.get("title", ""),
-                    "context": task_data.get("content", ""),
-                    "priority": task_data.get("priority", "normal"),
-                },
+                "arguments": submit_args,
             },
             "id": 2,
         }, session_id=session_id)
@@ -571,6 +891,32 @@ _current_agent_id: contextvars.ContextVar[str] = contextvars.ContextVar(
 # ── Auth Helpers ──────────────────────────────────────────────────
 
 _request_log: dict[str, list[float]] = defaultdict(list)
+
+
+def _check_auto_ban(client_ip: str) -> bool:
+    """Return True if IP is currently auto-banned."""
+    expiry = _auto_bans.get(client_ip)
+    if expiry and time.time() < expiry:
+        return True
+    if expiry:
+        del _auto_bans[client_ip]  # Ban expired
+    return False
+
+
+def _record_auth_failure(client_ip: str, context: str = ""):
+    """Record an auth failure. Auto-bans after threshold."""
+    now = time.time()
+    _auth_failures[client_ip] = [t for t in _auth_failures[client_ip] if now - t < AUTH_FAIL_WINDOW]
+    _auth_failures[client_ip].append(now)
+    count = len(_auth_failures[client_ip])
+
+    if count >= AUTH_FAIL_THRESHOLD:
+        _auto_bans[client_ip] = now + AUTO_BAN_DURATION
+        _log(f"AUTO-BAN: {client_ip} banned for {AUTO_BAN_DURATION}s ({count} failures in {AUTH_FAIL_WINDOW}s) [{context}]")
+        _audit("auto_ban", ip=client_ip, failures=count, context=context)
+        _tg_send(f"<b>[AUTO-BAN]</b> {_tg_escape(client_ip)}\n{count} auth failures → banned {AUTO_BAN_DURATION}s")
+    elif count >= AUTH_FAIL_THRESHOLD // 2:
+        _log(f"AUTH-WARN: {client_ip} at {count}/{AUTH_FAIL_THRESHOLD} failures [{context}]")
 
 
 def _verify_hmac(timestamp_str: str, body: bytes, signature_hex: str,
@@ -625,11 +971,10 @@ mcp = FastMCP(
 @mcp.tool()
 def ping() -> str:
     """Health check — verify gateway is alive."""
-    cc_status = "configured" if CC_MCP_URL else "not_configured"
     return json.dumps({
         "status": "ok",
         "server": "Cortex Gateway",
-        "cc_relay": cc_status,
+        "worker_url": CC_MCP_URL,
         "pending_approvals": len(_state["pending_approvals"]),
         "relay_queue": len(_state["relay_queue"]),
         "timestamp": _now(),
@@ -795,9 +1140,10 @@ def _tg_poller():
                     _save_state()
 
             for msg in messages:
+                text = msg.get("text", "")
+
                 if msg.get("is_bot"):
                     continue  # ignore bot messages
-                text = msg.get("text", "")
                 if text.startswith("/"):
                     _handle_tg_command(text, msg.get("from_name", "?"), msg.get("chat_id", 0), msg.get("from_id", 0))
             consecutive_errors = 0
@@ -848,6 +1194,28 @@ def _relay_worker():
                 break
 
 
+def _decrypt_tunnel_url(token: str) -> str:
+    """Decrypt tunnel URL token using CC_TUNNEL_SECRET. Pure Python, zero deps."""
+    import base64
+    raw = base64.urlsafe_b64decode(token)
+    if len(raw) < 17:
+        return ""
+    iv, ct = raw[:16], raw[16:]
+    key = hashlib.pbkdf2_hmac("sha256", CC_TUNNEL_SECRET.encode(), b"cortex-dns-sync", 100000)
+    out = bytearray()
+    for i in range(0, len(ct), 32):
+        bk = hashlib.sha256(key + iv + i.to_bytes(4, "big")).digest()
+        for j in range(min(32, len(ct) - i)):
+            out.append(ct[i + j] ^ bk[j])
+    return bytes(out).decode("utf-8", errors="replace")
+
+
+def _dns_url_sync():
+    """DEPRECATED: Tunnel DNS sync no longer needed — Cortex Worker is at cortex.mkyang.ai."""
+    _log("DNS URL sync disabled — using permanent Worker URL: https://cortex.mkyang.ai/mcp")
+    return
+
+
 # ── Entry Point ───────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -862,7 +1230,7 @@ if __name__ == "__main__":
     registry = _load_registry()
     agent_count = len(registry.get("agents", {}))
     _log(f"Starting Cortex Gateway on :{port}")
-    _log(f"Agents: {agent_count} | CC: {'configured' if CC_MCP_URL else 'NOT configured'}")
+    _log(f"Agents: {agent_count} | Worker: {CC_MCP_URL}")
     _log(f"TG: {'configured' if TG_BOT_TOKEN else 'NOT configured'} | CEO user_id: {'set' if TG_CEO_USER_ID else 'NOT set (any group member can command)'}")
     _log(f"Sensitivity rules: {len(RULES.get('block_keywords', []))} block, "
          f"{len(RULES.get('hold_keywords', []))} hold")
@@ -897,11 +1265,70 @@ if __name__ == "__main__":
             await original_app(scope, receive, send)
             return
 
+        path = scope.get("path", "")
         headers = dict(
             (k.decode("latin-1").lower(), v.decode("latin-1"))
             for k, v in scope.get("headers", [])
         )
         client_ip = scope.get("client", ("unknown", 0))[0]
+
+        # Auto-ban check — applies to all endpoints
+        if _check_auto_ban(client_ip):
+            _log(f"AUTO-BAN: Rejected request from banned IP {client_ip}")
+            resp = JSONResponse({"error": "Temporarily banned"}, status_code=403)
+            await resp(scope, receive, send)
+            return
+
+        # ── /callback endpoint — CC posts task results here ──
+        if path == "/callback" and scope.get("method", "GET") == "POST":
+            body = await _read_body(receive)
+            # Auth: verify shared secret (T3 fix: fail-closed + timing-safe)
+            cb_secret = headers.get("x-callback-secret", "")
+            if not GW_CALLBACK_SECRET:
+                _log(f"SECURITY: Callback rejected — GW_CALLBACK_SECRET not configured (fail-closed)")
+                resp = JSONResponse({"error": "Server misconfigured"}, status_code=500)
+                await resp(scope, receive, send)
+                return
+            if not hmac_mod.compare_digest(cb_secret, GW_CALLBACK_SECRET):
+                _log(f"Callback auth failed from {client_ip}")
+                _record_auth_failure(client_ip, "callback")
+                resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
+                await resp(scope, receive, send)
+                return
+            result, status_code = _handle_cc_callback(body, client_ip)
+            resp = JSONResponse(result, status_code=status_code)
+            await resp(scope, receive, send)
+            return
+
+        # ── /update-tunnel-url endpoint — DEPRECATED (Worker at cortex.mkyang.ai) ──
+        if path == "/update-tunnel-url" and scope.get("method", "GET") == "POST":
+            resp = JSONResponse({"status": "deprecated", "message": "Cortex Worker is at cortex.mkyang.ai — tunnel URL updates no longer needed"})
+            await resp(scope, receive, send)
+            return
+
+        # ── /cc-url endpoint — returns permanent Worker URL ──
+        if path == "/cc-url" and scope.get("method", "GET") == "GET":
+            resp = JSONResponse({
+                "url": CC_MCP_URL,
+                "status": "configured",
+            })
+            await resp(scope, receive, send)
+            return
+
+        # ── /onboard endpoint — self-service agent provisioning ──
+        if path == "/onboard" and scope.get("method", "GET") == "GET":
+            # Rate limit onboard attempts
+            if not _check_rate_limit(f"onboard:{client_ip}", limit=ONBOARD_RATE_LIMIT):
+                resp = JSONResponse({"error": "Rate limit exceeded"}, status_code=429)
+                await resp(scope, receive, send)
+                return
+            query_string = scope.get("query_string", b"").decode("latin-1")
+            result, status_code = _handle_onboard(query_string, client_ip)
+            if status_code in (401, 403, 404):
+                _record_auth_failure(client_ip, "onboard")
+            resp = JSONResponse(result, status_code=status_code)
+            await resp(scope, receive, send)
+            return
 
         # H2: Check Content-Length before reading body
         content_length = headers.get("content-length", "0")
@@ -928,6 +1355,7 @@ if __name__ == "__main__":
 
         if not (agent_id and hmac_sig and hmac_ts):
             _audit("auth_fail", ip=client_ip, reason="missing_credentials")
+            _record_auth_failure(client_ip, "mcp_missing_creds")
             resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
             await resp(scope, receive, send)
             return
@@ -935,18 +1363,21 @@ if __name__ == "__main__":
         agent = _get_agent(agent_id)
         if not agent:
             _audit("auth_fail", ip=client_ip, agent_id=agent_id, reason="unknown_agent")
+            _record_auth_failure(client_ip, f"mcp_unknown_agent:{agent_id}")
             resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
             await resp(scope, receive, send)
             return
 
         if agent.get("status") == "revoked":
             _audit("auth_fail", ip=client_ip, agent_id=agent_id, reason="revoked")
+            _record_auth_failure(client_ip, f"mcp_revoked:{agent_id}")
             resp = JSONResponse({"error": "Unauthorized"}, status_code=403)
             await resp(scope, receive, send)
             return
 
         if agent.get("trust_level") == "blocked":
             _audit("auth_fail", ip=client_ip, agent_id=agent_id, reason="blocked")
+            _record_auth_failure(client_ip, f"mcp_blocked:{agent_id}")
             resp = JSONResponse({"error": "Unauthorized"}, status_code=403)
             await resp(scope, receive, send)
             return
@@ -954,6 +1385,7 @@ if __name__ == "__main__":
         agent_secret = _get_agent_secret(agent)
         if not _verify_hmac(hmac_ts, body, hmac_sig, secret=agent_secret):
             _audit("auth_fail", ip=client_ip, agent_id=agent_id, reason="invalid_hmac")
+            _record_auth_failure(client_ip, f"mcp_bad_hmac:{agent_id}")
             resp = JSONResponse({"error": "Unauthorized"}, status_code=401)
             await resp(scope, receive, send)
             return
@@ -979,5 +1411,6 @@ if __name__ == "__main__":
     # Start background workers
     threading.Thread(target=_tg_poller, daemon=True).start()
     threading.Thread(target=_relay_worker, daemon=True).start()
+    threading.Thread(target=_dns_url_sync, daemon=True).start()
 
     uvicorn.run(auth_middleware, host="127.0.0.1", port=port)
