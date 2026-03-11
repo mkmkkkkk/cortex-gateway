@@ -71,7 +71,11 @@ def _load_env():
             if "=" not in line:
                 continue
             key, _, val = line.partition("=")
-            os.environ.setdefault(key.strip(), val.strip())
+            val = val.strip()
+            # Strip surrounding quotes (single or double)
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
+                val = val[1:-1]
+            os.environ.setdefault(key.strip(), val)
 
 
 _load_env()
@@ -113,6 +117,48 @@ ROLE_TOOLS = {
     "research": ["submit_request", "check_status", "ping"],
     "readonly": ["check_status", "ping"],
 }
+
+
+# ── Callback URL validation (Gateway-side SSRF prevention) ───────
+
+_PRIVATE_IP_PREFIXES = [
+    ("10.",), ("172.16.", "172.17.", "172.18.", "172.19.",
+     "172.20.", "172.21.", "172.22.", "172.23.",
+     "172.24.", "172.25.", "172.26.", "172.27.",
+     "172.28.", "172.29.", "172.30.", "172.31."),
+    ("192.168.",), ("127.",), ("169.254.",), ("0.",),
+]
+
+def _validate_callback_url(url: str, allowed_domains: list[str] | None = None) -> bool:
+    """Validate callback URL: HTTPS only, no private IPs, optional domain whitelist."""
+    if not url:
+        return True
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = parsed.hostname or ""
+    if not host:
+        return False
+    blocked = {"localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254", "[::1]"}
+    if host in blocked:
+        return False
+    # Block private IP ranges
+    import ipaddress
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+            return False
+    except ValueError:
+        pass  # hostname, not IP — OK
+    # Domain whitelist
+    if allowed_domains:
+        if host not in allowed_domains:
+            return False
+    return True
 
 
 # ── Logging ───────────────────────────────────────────────────────
@@ -1032,6 +1078,14 @@ def submit_request(
     if len(content) > 50_000:
         return json.dumps({"status": "error", "message": "Content too long (max 50000 chars)"})
 
+    # Callback URL validation (SSRF + domain whitelist)
+    if callback_url:
+        agent_info = _get_agent(agent_id)
+        allowed_domains = (agent_info or {}).get("allowed_callback_domains", [])
+        if not _validate_callback_url(callback_url, allowed_domains or None):
+            _audit("ssrf_block", agent_id=agent_id, callback_url=callback_url)
+            return json.dumps({"status": "error", "message": "Invalid callback_url — must be HTTPS to an allowed domain"})
+
     # Duplicate check
     if request_id in _state.get("requests", {}):
         return json.dumps({"status": "error", "message": "Duplicate request_id"})
@@ -1144,7 +1198,11 @@ def check_status(request_id: str) -> str:
     if trust != "owner" and info.get("agent_id") != agent_id:
         return json.dumps({"status": "not_found", "request_id": request_id})
 
-    result = {"request_id": request_id, **info}
+    # Filter response — only expose safe fields, strip internal state
+    _SAFE_FIELDS = {"status", "request_id", "request_type", "title", "priority",
+                     "submitted_at", "result", "agent_id"}
+    result = {k: v for k, v in info.items() if k in _SAFE_FIELDS}
+    result["request_id"] = request_id
 
     # Add guidance messages for lifecycle states
     st = info.get("status", "")
@@ -1280,6 +1338,10 @@ def _push_lifecycle_callback(req_id: str, info: dict, event: str, details: dict)
     """POST lifecycle event to agent's callback_url if configured."""
     cb_url = info.get("callback_url", "")
     if not cb_url:
+        return
+    # SSRF check before making outbound request
+    if not _validate_callback_url(cb_url):
+        _log(f"Lifecycle callback blocked (SSRF): {req_id} → {cb_url}")
         return
     payload = json.dumps({
         "request_id": req_id,

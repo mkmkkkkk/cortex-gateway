@@ -1,12 +1,33 @@
 {
   "agents": {
-    "oc": {
-      "name": "OpenClaw",
+    "test-owner": {
+      "name": "Test Owner",
       "owner": "michael",
       "role": "full",
       "trust_level": "owner",
-      "hmac_secret_env": "GW_HMAC_OC",
+      "hmac_secret_env": "GW_HMAC_TEST_OWNER",
       "rate_limit": 15,
+      "allowed_callback_domains": [],
+      "status": "active"
+    },
+    "test-team": {
+      "name": "Test Team Agent",
+      "owner": "bob",
+      "role": "full",
+      "trust_level": "team",
+      "hmac_secret_env": "GW_HMAC_TEST_TEAM",
+      "rate_limit": 10,
+      "allowed_callback_domains": [],
+      "status": "active"
+    },
+    "test-blocked": {
+      "name": "Blocked Agent",
+      "owner": "eve",
+      "role": "full",
+      "trust_level": "blocked",
+      "hmac_secret_env": "GW_HMAC_TEST_BLOCKED",
+      "rate_limit": 10,
+      "allowed_callback_domains": [],
       "status": "active"
     }
   }
