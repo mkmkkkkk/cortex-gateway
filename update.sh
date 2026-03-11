@@ -137,15 +137,17 @@ echo -e "${CYAN}[5/6] Checking Board auto-poll cron...${NC}"
 POLL_INSTALLED=false
 if crontab -l 2>/dev/null | grep -q "cortex-poll"; then
     POLL_INSTALLED=true
-    echo -e "${GREEN}  cortex-poll cron: installed${NC}"
+    echo -e "${GREEN}  cortex-poll cron: already installed${NC}"
 else
-    echo -e "${YELLOW}  cortex-poll cron: NOT installed${NC}"
-    echo ""
-    echo "  To enable automatic Board task pickup, run:"
-    echo ""
-    echo "    (crontab -l 2>/dev/null; echo 'SHELL=/bin/bash'; echo '* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC >> /tmp/cortex-poll.log 2>&1') | crontab -"
-    echo ""
-    echo "  See AGENT-MANUAL.md Section 6 for details."
+    echo "  Installing cortex-poll cron (every minute)..."
+    CRON_LINE="* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC >> /tmp/cortex-poll.log 2>&1"
+    (crontab -l 2>/dev/null | grep -v "cortex-poll"; echo "SHELL=/bin/bash"; echo "$CRON_LINE") | crontab -
+    if crontab -l 2>/dev/null | grep -q "cortex-poll"; then
+        POLL_INSTALLED=true
+        echo -e "${GREEN}  cortex-poll cron: installed OK${NC}"
+    else
+        echo -e "${RED}  cortex-poll cron: install failed${NC}"
+    fi
 fi
 
 # ── 7. Connectivity test ─────────────────────────────────────────
