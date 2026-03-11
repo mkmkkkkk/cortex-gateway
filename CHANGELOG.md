@@ -1,5 +1,23 @@
 # Changelog
 
+## [8.0.0] — 2026-03-11
+
+### Added — D58: Protocol Unification + Board Auto-Poll
+- **`cortex-proxy.py`** — MCP stdio-to-HTTPS bridge with HMAC auth. Any agent (CC/OC) connects to Worker via same proxy, differs only by `--agent-id` and `--secret-env`.
+- **`cortex-poll.py`** — Zero-token Board poller. Runs via cron every minute, only spawns `claude -p` when unclaimed tasks found. Configurable `--agent-id` and `--secret-env`.
+- **Board Auto-Poll setup** — AGENT-MANUAL.md Section 6 with complete cron setup instructions.
+
+### Changed
+- **Unified protocol** — CC and OC use identical MCP endpoint + HMAC auth. No more separate paths.
+- `cortex-poll.py` now accepts `--agent-id`, `--secret-env`, `--cwd` args (was CC-hardcoded).
+
+### Migration
+- Run `./update.sh` — it will prompt for cron setup.
+- Ensure `CORTEX_HMAC_SECRET_OC` is in `.env`.
+- Follow Section 6 of AGENT-MANUAL.md to install cron.
+
+---
+
 ## [7.2.0] — 2026-03-11
 
 ### Added — D55: Agent Cognitive Load Minimization

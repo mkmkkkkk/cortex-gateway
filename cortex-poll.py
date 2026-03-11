@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
-cortex-poll — Zero-token Board poller for CC.
+cortex-poll — Zero-token Board poller.
 
-Checks Cortex Board for tasks assigned to CC every invocation.
+Checks Cortex Board for unclaimed tasks every invocation.
 Designed to run via cron every 1 minute. Zero AI tokens consumed.
 Only spawns `claude -p` when a real task is found.
 
 Usage:
-  # Direct run (one-shot check)
+  # CC (default)
   python3 cortex-poll.py
 
-  # Cron (every minute)
-  * * * * * /workspace/cortex/cortex-poll.py > /dev/null 2>&1
+  # OC
+  python3 cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC
 
   # Dry run (detect only, no claude -p)
   python3 cortex-poll.py --dry-run
 
-Env vars required:
-  CORTEX_HMAC_SECRET_CC — HMAC secret for CC agent
+  # Cron (every minute)
+  * * * * * . /path/to/.env && python3 cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC >> /tmp/cortex-poll.log 2>&1
 """
 
+import argparse
 import hashlib
 import hmac as hmac_mod
 import json
@@ -29,28 +30,23 @@ import sys
 import time
 
 WORKER_URL = "https://cortex.mkyang.ai/mcp"
-AGENT_ID = "cc"
 LOCK_FILE = "/tmp/cortex-poll.lock"
 
 
-def _sign(body: bytes) -> dict:
+def _sign(agent_id: str, secret: str, body: bytes) -> dict:
     """HMAC-SHA256 auth headers."""
-    secret = os.environ.get("CORTEX_HMAC_SECRET_CC", "")
-    if not secret:
-        print("CORTEX_HMAC_SECRET_CC not set", file=sys.stderr)
-        sys.exit(1)
     ts = str(int(time.time()))
     msg = f"{ts}.".encode() + body
     sig = hmac_mod.new(secret.encode(), msg, hashlib.sha256).hexdigest()
     return {
-        "X-CC-Agent-ID": AGENT_ID,
+        "X-CC-Agent-ID": agent_id,
         "X-CC-Timestamp": ts,
         "X-CC-Signature": sig,
         "Content-Type": "application/json",
     }
 
 
-def _mcp_call(method: str, params: dict, msg_id: int) -> dict:
+def _mcp_call(agent_id: str, secret: str, method: str, params: dict, msg_id: int) -> dict:
     """Single MCP JSON-RPC call via curl. Returns parsed response."""
     body = json.dumps({
         "jsonrpc": "2.0",
@@ -58,7 +54,7 @@ def _mcp_call(method: str, params: dict, msg_id: int) -> dict:
         "params": params,
         "id": msg_id,
     }).encode()
-    headers = _sign(body)
+    headers = _sign(agent_id, secret, body)
     cmd = ["curl", "-s", "-X", "POST", WORKER_URL, "--max-time", "10"]
     for k, v in headers.items():
         cmd += ["-H", f"{k}: {v}"]
@@ -85,11 +81,21 @@ def _extract_posts(resp: dict) -> list:
 
 
 def main():
-    dry_run = "--dry-run" in sys.argv
+    parser = argparse.ArgumentParser(description="Cortex Board poller")
+    parser.add_argument("--agent-id", default="cc", help="Agent ID (default: cc)")
+    parser.add_argument("--secret-env", default="CORTEX_HMAC_SECRET_CC",
+                        help="Env var name for HMAC secret (default: CORTEX_HMAC_SECRET_CC)")
+    parser.add_argument("--dry-run", action="store_true", help="Detect only, don't execute")
+    parser.add_argument("--cwd", default=None, help="Working directory for claude -p")
+    args = parser.parse_args()
+
+    secret = os.environ.get(args.secret_env, "")
+    if not secret:
+        print(f"{args.secret_env} not set", file=sys.stderr)
+        sys.exit(1)
 
     # Lock: prevent overlapping runs (if claude -p takes > 1 min)
-    if not dry_run and os.path.exists(LOCK_FILE):
-        # Check if lock is stale (> 30 min)
+    if not args.dry_run and os.path.exists(LOCK_FILE):
         try:
             age = time.time() - os.path.getmtime(LOCK_FILE)
             if age < 1800:
@@ -97,8 +103,8 @@ def main():
         except OSError:
             pass
 
-    # Query Board for unclaimed tasks assigned to CC
-    resp = _mcp_call("tools/call", {
+    # Query Board for unclaimed tasks
+    resp = _mcp_call(args.agent_id, secret, "tools/call", {
         "name": "board_read",
         "arguments": {"status": "open", "limit": 5},
     }, 1)
@@ -109,11 +115,11 @@ def main():
     tasks = [p for p in posts if p.get("type") == "request" and not p.get("claimed_by")]
 
     if not tasks:
-        if dry_run:
+        if args.dry_run:
             print("No unclaimed tasks found.")
         sys.exit(0)
 
-    if dry_run:
+    if args.dry_run:
         print(f"Found {len(tasks)} task(s):")
         for t in tasks:
             print(f"  [{t.get('post_id')}] {t.get('title')}")
@@ -140,14 +146,12 @@ def main():
                 f"3. Reply with result: board_reply(post_id=\"{post_id}\", ...)\n"
             )
 
-            # Spawn claude -p to execute
             subprocess.run(
                 ["claude", "-p", prompt],
-                timeout=3600,  # 60 min max per task
-                cwd="/workspace",
+                timeout=3600,
+                cwd=args.cwd or os.getcwd(),
             )
     finally:
-        # Remove lock
         try:
             os.unlink(LOCK_FILE)
         except OSError:

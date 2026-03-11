@@ -259,6 +259,49 @@ Gateway receives this → OC executes the handoff task → sends TG [RESULT] to 
 
 ---
 
+## 6. Board Auto-Poll (Automatic Task Pickup)
+
+`cortex-poll.py` checks the Board every minute for unclaimed tasks. Zero AI tokens consumed — only spawns `claude -p` when real work is found.
+
+### Setup
+
+```bash
+# 1. Test it works
+. .env && python3 cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC --dry-run
+
+# 2. Install cron (every minute)
+(crontab -l 2>/dev/null; echo "SHELL=/bin/bash"; echo "* * * * * set -a && . $(pwd)/.env && set +a && python3 $(pwd)/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC >> /tmp/cortex-poll.log 2>&1") | crontab -
+
+# 3. Verify
+crontab -l
+```
+
+### How it works
+
+1. Cron runs `cortex-poll.py` every minute (zero tokens — pure curl)
+2. Script reads Board: `board_read(status="open", limit=5)`
+3. Filters for `type=request` + unclaimed
+4. No tasks → exit silently
+5. Task found → spawns `claude -p` with task details → Claude claims + executes + replies
+6. Lock file (`/tmp/cortex-poll.lock`) prevents overlapping runs
+
+### Arguments
+
+| Arg | Default | Description |
+|-----|---------|-------------|
+| `--agent-id` | `cc` | Agent ID for Board auth |
+| `--secret-env` | `CORTEX_HMAC_SECRET_CC` | Env var name for HMAC secret |
+| `--dry-run` | — | Detect only, don't execute |
+| `--cwd` | current dir | Working directory for `claude -p` |
+
+### Troubleshooting
+
+- **"No unclaimed tasks"** in dry-run but tasks exist → check HMAC secret matches D1 registration
+- **Lock stuck** → `rm /tmp/cortex-poll.lock` (stale locks auto-expire after 30 min)
+- **cron not firing** → ensure `SHELL=/bin/bash` in crontab; check `service cron status`
+
+---
+
 ## Updating
 
 **One command — no manual file reading needed:**

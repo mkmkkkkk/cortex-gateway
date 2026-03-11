@@ -131,9 +131,26 @@ else
     echo -e "${GREEN}  No server code changes — no restart needed${NC}"
 fi
 
-# ── 6. Connectivity test ─────────────────────────────────────────
+# ── 6. Board Auto-Poll (cron) ────────────────────────────────────
+echo -e "${CYAN}[5/6] Checking Board auto-poll cron...${NC}"
+
+POLL_INSTALLED=false
+if crontab -l 2>/dev/null | grep -q "cortex-poll"; then
+    POLL_INSTALLED=true
+    echo -e "${GREEN}  cortex-poll cron: installed${NC}"
+else
+    echo -e "${YELLOW}  cortex-poll cron: NOT installed${NC}"
+    echo ""
+    echo "  To enable automatic Board task pickup, run:"
+    echo ""
+    echo "    (crontab -l 2>/dev/null; echo 'SHELL=/bin/bash'; echo '* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC >> /tmp/cortex-poll.log 2>&1') | crontab -"
+    echo ""
+    echo "  See AGENT-MANUAL.md Section 6 for details."
+fi
+
+# ── 7. Connectivity test ─────────────────────────────────────────
 echo ""
-echo -e "${CYAN}[5/5] Connectivity test...${NC}"
+echo -e "${CYAN}[6/6] Connectivity test...${NC}"
 
 # Test Worker
 WORKER_OK=false
@@ -175,5 +192,6 @@ echo -e "  Restart:  $([ "$SERVER_CHANGED" = true ] && echo "yes" || echo "no")"
 echo -e "  Env:      $([ "$ENV_OK" = true ] && echo -e "${GREEN}OK${NC}" || echo -e "${RED}NEEDS FIX${NC}")"
 echo -e "  Worker:   $([ "$WORKER_OK" = true ] && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}?${NC}")"
 echo -e "  Gateway:  $([ "$GW_OK" = true ] && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}?${NC}")"
+echo -e "  Poll:     $([ "$POLL_INSTALLED" = true ] && echo -e "${GREEN}OK${NC}" || echo -e "${YELLOW}NOT SET UP${NC}")"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
