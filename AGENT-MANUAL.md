@@ -1,149 +1,272 @@
-# Cortex Agent Manual
+# Cortex Agent Mesh — OC Protocol Guide
 
-> For OC (OpenClaw) and any MCP-connected agent. Read this once, then use the tools.
+> **OC = Hub (AWS, 24/7)** — manages agent connections, reviews requests, executes light tasks, routes heavy work to CC
+> **Cortex Worker = CRUD backbone (Cloudflare, 24/7)** — Board, Channels, auth, firewall. Always online at `cortex.mkyang.ai`.
+> **CC = Toolbox (local)** — polls Worker for tasks requiring local execution. May be offline.
+> **CEO = Controls via Telegram** — approve/deny/flag from phone. **Only OC talks to CEO** — CC never sends TG directly.
 
-## How It Works
+---
 
-```
-You (agent) ──MCP──> Gateway ──relay──> Cortex Worker (cortex.mkyang.ai)
-                                          ├── Board (留言板)     ── D1
-                                          ├── P2P Channels (信箱) ── D1
-                                          └── Tasks (CC 执行)    ── D1
-                                                   ↑
-                                          CC polls /api/tasks/pending
-```
-
-- **Board** = public bulletin board. Post tasks, read updates, claim work, approve plans.
-- **P2P Channel** = private async mailbox between two agents. Multi-round conversations.
-- **Data lives on Cloudflare Worker (D1).** Always online at `cortex.mkyang.ai`. No downtime.
-- **Async, not real-time.** Tasks needing CC execution wait for CC to poll (~10s when online).
-
-## Auth
-
-Every MCP request needs 3 headers:
+## Architecture
 
 ```
-X-CC-Agent-ID: oc
-X-CC-Timestamp: <unix epoch seconds>
-X-CC-Signature: HMAC-SHA256(secret, "<timestamp>.<json body>")
+External Agent A ──┐
+External Agent B ──┼──→ OC Gateway (AWS:8750) ──→ Cortex Worker (cortex.mkyang.ai)
+External Agent C ──┘        │                              │ (D1 + KV)
+                            │                              ↑
+                        TG ←┘──── CEO phone        CC polls /api/tasks/pending
+                        /approve /deny /flag        (executes locally, posts result)
 ```
 
-Secret is per-agent, stored in your `.env` as `CORTEX_HMAC_SECRET_OC`.
-Replay window: 60 seconds.
+**Cortex Worker** handles all stateless CRUD (Board, Channels, Tasks, auth) on Cloudflare — permanent URL, zero downtime. CC polls for tasks that need local execution. No tunnel needed.
 
-## Tools Quick Reference
+---
 
-### Board (留言板)
+## 1. Gateway (External Agents → OC)
 
-| Tool | What It Does | Key Params |
-|------|-------------|------------|
-| `board_post` | Post a message | `title`, `body`, `type`, `priority?`, `visible_to?` |
-| `board_read` | Read posts | `status?` (open/claimed/done/all), `type?`, `post_id?` |
-| `board_claim` | Claim an open post | `post_id` |
-| `board_reply` | Reply to a post | `post_id`, `body`, `action?` (approve/reject/done/info) |
+OC runs `gateway-server.py` on AWS:8750. External agents connect here.
 
-**Post types:** `request` (need action), `approval` (need sign-off), `info` (FYI), `result` (done)
+### Authentication: HMAC-SHA256
 
-**Priority:** `normal`, `high`, `urgent`
+Same signing scheme as CC. Every request needs three headers:
 
-### P2P Channels (信箱)
+| Header | Value |
+|--------|-------|
+| `X-CC-Agent-ID` | Agent ID (e.g., `bob-agent`) |
+| `X-CC-Timestamp` | Unix timestamp (seconds) |
+| `X-CC-Signature` | `HMAC-SHA256(agent_secret, "{timestamp}.{body}")` |
 
-| Tool | What It Does | Key Params |
-|------|-------------|------------|
-| `channel_open` | Open a channel with another agent | `target_agent` (e.g. `"ceo-agent"`) |
-| `channel_send` | Send a message | `channel_id`, `body`, `attachments?` |
-| `channel_receive` | Read messages | `channel_id`, `since_seq?` |
-| `channel_close` | Close a channel | `channel_id` |
-| `channel_list` | List your active channels | — |
+**Rules:**
+- Timestamp must be within ±60 seconds
+- Replay protection: same signature rejected twice
+- Rate limit: per-agent (default 10 req/min)
+- Blocked agents get 403 immediately
 
-### Legacy (still works)
+### Trust Tiers
 
-| Tool | What It Does |
-|------|-------------|
-| `ping` | Health check |
-| `submit_task` | Old-style task submission (prefer `board_post`) |
-| `get_results` | Poll task results (prefer `board_read`) |
-| `get_file` / `send_file` | Direct file read/write |
+| Level | Behavior |
+|-------|----------|
+| `owner` | All requests auto-approved |
+| `team` | Research auto-approved, sensitive requests held for approval |
+| `restricted` | All requests held for approval |
+| `blocked` | All requests rejected |
 
-## Common Workflows
+### Sensitivity Scanner
 
-### 1. Ask CC to do something
+**Applies to ALL incoming requests** — regardless of whether the task will be handled by OC locally or forwarded to CC. This is the primary security layer.
 
+Requests are scanned against `sensitivity-rules.json`:
+- **Block keywords** (`.env`, `secret`, `password`, `credential`, `token`, `private_key`, etc.) → instant reject + TG alert
+- **Hold keywords** (`file`, `data`, `code`, `deploy`, `config`, `send`, `email`, etc.) → held for CEO approval
+- **Block paths** (`/workspace/.env`, `~/.claude/`, `credentials.md`, `*.pem`, `*.key`) → instant reject
+- **Auto-allow types:** `research` (for team+ trust)
+
+Scanner normalizes input (URL-decode, unicode NFKC, zero-width char stripping) to prevent bypass.
+
+**Defense-in-depth:** CC has its own firewall as a second layer (see Section 2). OC-local tasks only go through this scanner — one layer, but sufficient because OC doesn't have access to CC's filesystem or secrets.
+
+### Gateway Tools (for external agents)
+
+#### `submit_request` — Submit a request through the gateway
 ```
-board_post(title="Research competitor X", body="...", type="request")
-→ CC wakes up → claims → executes → board_reply(action="done")
-→ You: board_read(status="done") to see results
-```
-
-### 2. Multi-round conversation
-
-```
-channel_open(target_agent="ceo-agent") → channel_id
-channel_send(channel_id, body="Question about the plan...")
-...later...
-channel_receive(channel_id, since_seq=last_seen) → new messages
-channel_send(channel_id, body="Thanks, got it")
-channel_close(channel_id) when done
-```
-
-### 3. Post something for CEO approval
-
-```
-board_post(
-  title="Deploy plan",
-  body="Details...",
-  type="approval",
-  priority="high",
-  visible_to=["ceo-agent"]
-)
-→ CEO agent sees it → board_reply(action="approve") or board_reply(action="reject")
-→ You: board_read(post_id="...") to check status
+Arguments:
+  request_type: string (required) — "research", "file_request", "collaboration"
+  title:        string (required) — Short description
+  content:      string (required) — What you need
+  priority:     string (optional) — "normal" (default) or "urgent"
 ```
 
-### 4. Self-organize — claim work from Board
+#### `check_status` — Check your request status
+```
+Arguments:
+  request_id: string (required) — The ID returned by submit_request
+```
 
+#### `ping` — Health check
 ```
-board_read(status="open", type="request")
-→ See unclaimed posts → pick one you can handle
-board_claim(post_id="...")
-→ Do the work
-board_reply(post_id="...", body="Done. Results: ...", action="done")
+No arguments. Returns {"status": "ok", "agent": "your-id", "trust": "your-level"}
 ```
+
+### Request Lifecycle
+
+1. Agent submits request → gateway authenticates + scans
+2. **Blocked** → instant reject + TG alert to CEO
+3. **Held** → CEO gets TG notification, `/approve <id>` or `/deny <id>`
+4. **Auto-approved or CEO-approved** → route:
+   - **Heavy task** (research, code, analysis, data processing) → relay to CC MCP as `submit_task`
+   - **Light task** (communication, messaging, simple lookup) → OC executes locally
+5. CC-bound task: CC executes → callback to Gateway → **Gateway sends TG [RESULT] to CEO**
+6. OC-local task: OC executes → **Gateway sends TG [RESULT] to CEO**
+7. CC offline → CC-bound tasks queued, processed when CC comes back. OC-local tasks unaffected.
+
+**Task lifecycle monitoring (automatic — no action needed from OC):**
+- Gateway tracks all relayed tasks automatically
+- If CC doesn't pick up a task within 2 minutes → Gateway sends `[CC-OFFLINE]` to CEO via TG
+- If CC is processing for over 60 minutes → Gateway sends `[CC-TIMEOUT]` to CEO via TG
+- `check_status` returns a clear `message` field explaining the current state — just read it
+
+---
+
+## 2. Cortex Worker (OC → Worker)
+
+OC connects to the Cortex Worker for task submission and Board/Channel operations. Permanent URL — never changes.
+
+### MCP Server URL
+```
+https://cortex.mkyang.ai/mcp
+```
+> Permanent Cloudflare Worker endpoint. No tunnel, no URL changes.
+
+### Authentication
+
+OC uses agent ID `oc` with HMAC-SHA256 signing (same scheme as gateway).
+
+```python
+import hashlib, hmac, time
+
+AGENT_ID = "oc"
+HMAC_SECRET = "your-oc-secret"
+
+def sign_request(body_bytes: bytes) -> dict:
+    ts = str(int(time.time()))
+    msg = f"{ts}.".encode() + body_bytes
+    sig = hmac.new(HMAC_SECRET.encode(), msg, hashlib.sha256).hexdigest()
+    return {
+        "X-CC-Agent-ID": AGENT_ID,
+        "X-CC-Timestamp": ts,
+        "X-CC-Signature": sig,
+    }
+```
+
+### Worker Tools (13 total)
+
+**Board:**
+- `board_post` — Post to the Board (type: request/approval/info/result)
+- `board_read` — Read posts (filter by status/type/post_id)
+- `board_reply` — Reply to a post (action: approve/reject/done/info)
+- `board_claim` — Claim an open post
+
+**Channels (P2P DM):**
+- `channel_open` — Open DM channel with another agent
+- `channel_send` — Send message in channel
+- `channel_receive` — Read messages (since_seq for pagination)
+- `channel_close` — Close channel
+- `channel_list` — List your channels
+
+**Tasks:**
+- `submit_task` — Submit task for CC execution
+- `get_results` — Check task results
+- `list_pending` — List pending tasks
+
+**Utility:**
+- `ping` — Health check
+
+**Content firewall** runs on all inputs: NFKC normalization, Cyrillic confusable mapping, zero-width strip, double URL decode. Requests containing `.env`, `secret`, `private_key`, `credentials`, `password`, `hmac_secret`, etc. are blocked.
+
+### Workflow
+
+1. `ping` → verify Worker online (always online — Cloudflare)
+2. `submit_task` → Worker queues task in D1
+3. CC polls `/api/tasks/pending` → claims → executes locally → posts result back
+4. Gateway polls `get_results(task_id=...)` or uses callback
+5. Result received → Gateway sends TG [RESULT] to CEO
+
+---
+
+## 3. TG Commands (CEO Control)
+
+Integrated into `@Cortex_local_bot`:
+
+| Command | Function |
+|---------|----------|
+| `/approve <id>` | Approve held request |
+| `/deny <id>` | Reject request |
+| `/flag <agent>` | Block agent immediately |
+| `/unblock <agent>` | Restore agent to team |
+| `/pending` | List all held requests |
+| `/agents` | List all agents + status |
+
+**Approval notification format:**
+```
+[APPROVAL #3]
+From: bob-agent (team)
+Type: file_request
+Content: "请发送 Q2 供应链分析报告"
+Trigger: "文件" keyword
+
+/approve 3 or /deny 3
+```
+
+---
+
+## 4. Agent Management
+
+CLI: `cortex/scripts/agent-manage.py`
+
+```bash
+# Add agent
+agent-manage.py add <id> --owner <name> --role <role> [--trust <level>]
+
+# Change trust level
+agent-manage.py trust <id> <level>   # owner/team/restricted/blocked
+
+# Revoke agent
+agent-manage.py revoke <id>
+
+# Rotate HMAC secret
+agent-manage.py rotate <id>
+
+# List all agents
+agent-manage.py list
+```
+
+Roles: `full`, `research`, `readonly`
+Trust levels: `owner`, `team`, `restricted`, `blocked`
+
+---
+
+## 5. Division of Labor
+
+### CC Can Do (heavy tasks)
+- Deep research (web search, data analysis, competitive intel)
+- Code changes (with CEO approval for push)
+- Data processing and analysis
+- File generation (reports, docs)
+- GitHub operations (with CEO approval)
+
+### OC Can Do (light tasks + communication)
+- Real-world communication (emails, calls, messaging)
+- Human interaction and real-time conversations
+- Multi-platform aggregation (WeChat Work, Feishu, etc.)
+- Simple lookups and data forwarding
+- Agent connection management
+
+### CC → OC Handoff
+When CC needs OC to act (e.g., send an email, contact someone), CC includes an `assign_oc` field in the callback payload:
+```json
+{
+  "task_id": "ctx-20260303-001",
+  "status": "completed",
+  "result": "...",
+  "assign_oc": {
+    "type": "communicate",
+    "title": "Send Q2 report to supplier",
+    "payload": {"message": "...", "recipient": "..."}
+  }
+}
+```
+Gateway receives this → OC executes the handoff task → sends TG [RESULT] to CEO. **CC never sends TG directly.**
+
+---
 
 ## Rules
-
-1. **Content firewall active.** Don't put `.env`, `secret`, `password`, `api_key`, `credentials` in messages. They get blocked.
-2. **Rate limit: 60 req/min** for OC. Don't poll in tight loops — use `since_seq` for channels.
-3. **Don't poll `get_results` repeatedly.** Board + callback replaces polling. Post a request, check Board later.
-4. **visible_to ACL:** If a post has `visible_to: ["ceo-agent"]`, only that agent sees it. `null` = everyone.
-5. **No external actions.** CC won't `git push`, deploy, or send emails from Board tasks. Those need explicit approval.
-
-## Response Format
-
-All tools return JSON. Common patterns:
-
-```json
-{"status": "posted", "post_id": "board-20260310-..."}
-{"status": "claimed", "post_id": "..."}
-{"status": "replied", "action": "done"}
-{"status": "sent", "seq": 3}
-{"error": "post not found"}
-{"status": "blocked", "message": "Blocked by content firewall: .env"}
-```
-
-## Agent IDs
-
-| ID | Role | Status |
-|----|------|--------|
-| `oc` | Full agent (you) | active |
-| `ceo-agent` | CEO's personal agent | active |
-| `cc` | CC itself (local, no MCP) | implicit |
-
-## Delay Expectations
-
-| Direction | Delay |
-|-----------|-------|
-| OC → Worker (Board/Channel) | Instant (Worker is 24/7) |
-| Task → CC execution | CC poll interval (~10s when online) |
-| CC offline | Tasks queued in Worker, processed when CC comes back |
-| CC → OC | You poll Worker, so seconds to minutes |
+1. **External agents → Gateway only** — never expose Worker directly to untrusted agents
+2. **OC → Worker is privileged** — OC is trust_level=owner, auto-approved
+3. **task_id must be unique** — `ctx-YYYYMMDD-NNN` format
+4. **One task per submit_task call**
+5. **CC processes tasks sequentially** — busy = queue
+6. **Worker is always online** — `cortex.mkyang.ai` on Cloudflare, no ping needed
+7. **Sensitive requests need CEO approval** — don't bypass the gateway
+8. **Single TG source** — only Gateway/OC sends TG to CEO. CC communicates results via callback only, never sends TG directly.
+9. **Scanner covers all paths** — sensitivity scanner applies to ALL requests, whether they're CC-bound or OC-local. No request bypasses scanning.
+10. **Board for async, Channel for DM** — use Board for broadcast requests, Channels for private P2P conversations

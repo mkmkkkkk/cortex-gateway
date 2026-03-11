@@ -1122,7 +1122,20 @@ def check_status(request_id: str) -> str:
     if trust != "owner" and info.get("agent_id") != agent_id:
         return json.dumps({"status": "not_found", "request_id": request_id})
 
-    return json.dumps({"request_id": request_id, **info})
+    result = {"request_id": request_id, **info}
+
+    # Add guidance messages for lifecycle states
+    st = info.get("status", "")
+    if st == "cc_offline":
+        result["message"] = "CC is offline — task was not picked up. You may handle it yourself or wait for CC to come back online."
+    elif st == "cc_timeout":
+        result["message"] = "CC started but did not finish in time. CEO has been notified."
+    elif st == "relayed":
+        result["message"] = "Task sent to CC, waiting for response."
+    elif st in ("cc_done", "cc_failed"):
+        result["message"] = "Task completed by CC."
+
+    return json.dumps(result)
 
 
 # ── Background Workers ────────────────────────────────────────────
@@ -1208,6 +1221,137 @@ def _decrypt_tunnel_url(token: str) -> str:
         for j in range(min(32, len(ct) - i)):
             out.append(ct[i + j] ^ bk[j])
     return bytes(out).decode("utf-8", errors="replace")
+
+
+def _poll_worker_task_status(task_id: str) -> dict:
+    """Poll Worker for a single task's status via MCP get_results. Returns {} on error."""
+    try:
+        init_resp, sid = _cc_mcp_request({
+            "jsonrpc": "2.0", "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "cortex-gateway-lifecycle", "version": "1.0"}},
+            "id": 1,
+        })
+        _cc_mcp_request({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
+        resp, _ = _cc_mcp_request({
+            "jsonrpc": "2.0", "method": "tools/call",
+            "params": {"name": "get_results", "arguments": {"task_id": task_id}},
+            "id": 2,
+        }, session_id=sid)
+        # MCP response: {"result": {"content": [{"type":"text","text":"..."}]}}
+        content = resp.get("result", {}).get("content", [])
+        if content and content[0].get("text"):
+            return json.loads(content[0]["text"])
+    except Exception as e:
+        _log(f"Lifecycle poll error for {task_id}: {e}")
+    return {}
+
+
+# Timeout thresholds (seconds)
+_LIFECYCLE_PENDING_TIMEOUT = 120      # 2min — CC polls every 10s, pending > 2min = offline
+_LIFECYCLE_PROCESSING_TIMEOUT = 3600  # 60min — CC likely crashed
+_LIFECYCLE_CHECK_INTERVAL = 60        # check every 60s
+_lifecycle_alerted: set[str] = set()  # track tasks we've already alerted on
+
+
+def _task_lifecycle_worker():
+    """Background thread: detect stale tasks and escalate.
+
+    Scans all 'relayed' tasks. If CC hasn't picked up (pending > 2min)
+    or is stuck (processing > 60min), alerts CEO via TG and updates state.
+    OC just reads check_status — no timeout logic needed on OC side.
+    """
+    _log("Task lifecycle worker started")
+    while True:
+        time.sleep(_LIFECYCLE_CHECK_INTERVAL)
+
+        now_ts = time.time()
+        stale_candidates = []
+
+        with _state_lock:
+            for req_id, info in _state.get("requests", {}).items():
+                status = info.get("status", "")
+                if status not in ("relayed", "approved"):
+                    continue
+                relayed_at = info.get("relayed_at") or info.get("submitted_at", "")
+                if not relayed_at:
+                    continue
+                stale_candidates.append((req_id, info.copy(), relayed_at))
+
+        for req_id, info, relayed_at_str in stale_candidates:
+            if req_id in _lifecycle_alerted:
+                continue
+
+            try:
+                relayed_dt = datetime.fromisoformat(relayed_at_str.replace("Z", "+00:00"))
+                age_sec = now_ts - relayed_dt.timestamp()
+            except (ValueError, TypeError):
+                continue
+
+            if age_sec < _LIFECYCLE_PENDING_TIMEOUT:
+                continue  # too early to check
+
+            # Poll Worker for actual task status
+            worker_status = _poll_worker_task_status(req_id)
+            if not worker_status:
+                continue  # Worker unreachable, skip this cycle
+
+            w_status = worker_status.get("status", "")
+
+            if w_status in ("done", "failed"):
+                # Callback may have been missed — update state from Worker data
+                with _state_lock:
+                    if req_id in _state["requests"]:
+                        _state["requests"][req_id]["status"] = f"cc_{w_status}"
+                        _state["requests"][req_id]["cc_result"] = worker_status.get("result")
+                        _state["requests"][req_id]["completed_at"] = worker_status.get("completed_at", _now())
+                        _save_state()
+                _log(f"Lifecycle: {req_id} completed (caught via poll, status={w_status})")
+                _lifecycle_alerted.add(req_id)
+                continue
+
+            if w_status == "pending" and age_sec > _LIFECYCLE_PENDING_TIMEOUT:
+                # CC hasn't even claimed it — CC is offline
+                _lifecycle_alerted.add(req_id)
+                with _state_lock:
+                    if req_id in _state["requests"]:
+                        _state["requests"][req_id]["status"] = "cc_offline"
+                        _state["requests"][req_id]["detected_at"] = _now()
+                        _save_state()
+                _log(f"Lifecycle: {req_id} — CC offline (pending {int(age_sec)}s)")
+                _audit("cc_offline", request_id=req_id, age_sec=int(age_sec))
+                _tg_send(
+                    f"<b>[CC-OFFLINE]</b> {_tg_escape(req_id)}\n"
+                    f"Task pending {int(age_sec)}s — CC not polling.\n"
+                    f"Task: {_tg_escape(info.get('title', '?')[:100])}"
+                )
+                continue
+
+            if w_status == "processing":
+                claimed_at_str = worker_status.get("claimed_at")
+                if claimed_at_str:
+                    try:
+                        claimed_dt = datetime.fromisoformat(claimed_at_str.replace("Z", "+00:00"))
+                        proc_sec = now_ts - claimed_dt.timestamp()
+                    except (ValueError, TypeError):
+                        proc_sec = age_sec
+                else:
+                    proc_sec = age_sec
+
+                if proc_sec > _LIFECYCLE_PROCESSING_TIMEOUT:
+                    _lifecycle_alerted.add(req_id)
+                    with _state_lock:
+                        if req_id in _state["requests"]:
+                            _state["requests"][req_id]["status"] = "cc_timeout"
+                            _state["requests"][req_id]["detected_at"] = _now()
+                            _save_state()
+                    _log(f"Lifecycle: {req_id} — CC timeout (processing {int(proc_sec)}s)")
+                    _audit("cc_timeout", request_id=req_id, proc_sec=int(proc_sec))
+                    _tg_send(
+                        f"<b>[CC-TIMEOUT]</b> {_tg_escape(req_id)}\n"
+                        f"Processing {int(proc_sec // 60)}min — CC may be stuck.\n"
+                        f"Task: {_tg_escape(info.get('title', '?')[:100])}"
+                    )
 
 
 def _dns_url_sync():
@@ -1411,6 +1555,7 @@ if __name__ == "__main__":
     # Start background workers
     threading.Thread(target=_tg_poller, daemon=True).start()
     threading.Thread(target=_relay_worker, daemon=True).start()
+    threading.Thread(target=_task_lifecycle_worker, daemon=True).start()
     threading.Thread(target=_dns_url_sync, daemon=True).start()
 
     uvicorn.run(auth_middleware, host="127.0.0.1", port=port)
