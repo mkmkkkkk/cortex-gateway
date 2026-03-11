@@ -114,7 +114,9 @@ def main():
     parser.add_argument("--secret-env", default="CORTEX_HMAC_SECRET_CC",
                         help="Env var name for HMAC secret (default: CORTEX_HMAC_SECRET_CC)")
     parser.add_argument("--dry-run", action="store_true", help="Detect only, don't execute")
-    parser.add_argument("--cwd", default=None, help="Working directory for claude -p")
+    parser.add_argument("--cli", default="claude",
+                        help="AI CLI command (default: claude). E.g.: claude, happy, openclaw")
+    parser.add_argument("--cwd", default=None, help="Working directory for AI CLI")
     args = parser.parse_args()
 
     secret = os.environ.get(args.secret_env, "")
@@ -180,14 +182,14 @@ def main():
                 print(f"[{ts}] Failed to claim {post_id}, skipping")
                 continue
 
-            print(f"[{ts}] Claimed {post_id}, spawning claude -p...")
+            print(f"[{ts}] Claimed {post_id}, spawning {args.cli} -p...")
 
-            # 2. Spawn claude -p with ONLY the task content
-            #    No Board instructions — claude just executes the task.
+            # 2. Spawn AI CLI with ONLY the task content
+            #    No Board instructions — AI just executes the task.
             prompt = f"Task: {title}\n\n{body}\n\nExecute this task and provide the result."
 
             result = subprocess.run(
-                ["claude", "-p", prompt],
+                [args.cli, "-p", prompt],
                 capture_output=True,
                 text=True,
                 timeout=3600,
