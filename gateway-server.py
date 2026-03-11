@@ -104,6 +104,35 @@ REQUEST_ID_PATTERN = re.compile(r"^[a-zA-Z0-9_\-]{1,128}$")  # H6: strict format
 ONBOARD_RATE_LIMIT = 5  # max onboard attempts per minute
 INVITE_DEFAULT_HOURS = 24
 
+# ── Version cross-validation (D57) ───────────────────────────────
+GATEWAY_VERSION = "2.0"
+COMPATIBLE_WORKER_MAJOR = 3  # Gateway requires Worker major version 3
+_worker_version: str | None = None
+_worker_version_lock = threading.Lock()
+
+
+def _record_worker_version(init_resp: dict) -> str | None:
+    """Extract and store Worker version from MCP initialize response."""
+    global _worker_version
+    server_info = init_resp.get("result", {}).get("serverInfo", {})
+    ver = server_info.get("version")
+    if ver:
+        with _worker_version_lock:
+            _worker_version = ver
+    return ver
+
+
+def _check_worker_version_compatible(version_str: str | None) -> bool:
+    """Check if Worker version is compatible (same major version)."""
+    if not version_str:
+        return True  # Unknown = don't block, just warn
+    try:
+        major = int(version_str.split(".")[0])
+        return major == COMPATIBLE_WORKER_MAJOR
+    except (ValueError, IndexError):
+        return False
+
+
 # ── Auto-ban system (ported from cortex-mcp-server.py) ───────────
 AUTH_FAIL_WINDOW = 600  # 10 minutes
 AUTH_FAIL_THRESHOLD = 10  # failures before ban
@@ -889,10 +918,11 @@ def relay_to_cc(task_data: dict) -> dict:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "cortex-gateway", "version": "1.0"},
+                "clientInfo": {"name": "cortex-gateway", "version": GATEWAY_VERSION},
             },
             "id": 1,
         })
+        _record_worker_version(init_resp)
 
         # Step 2: Send initialized notification
         _cc_mcp_request(
@@ -1017,10 +1047,15 @@ mcp = FastMCP(
 @mcp.tool()
 def ping() -> str:
     """Health check — verify gateway is alive."""
+    with _worker_version_lock:
+        wv = _worker_version
     return json.dumps({
         "status": "ok",
         "server": "Cortex Gateway",
+        "gateway_version": GATEWAY_VERSION,
         "worker_url": CC_MCP_URL,
+        "worker_version": wv,
+        "version_compatible": _check_worker_version_compatible(wv),
         "pending_approvals": len(_state["pending_approvals"]),
         "relay_queue": len(_state["relay_queue"]),
         "timestamp": _now(),
@@ -1309,9 +1344,10 @@ def _poll_worker_task_status(task_id: str) -> dict:
         init_resp, sid = _cc_mcp_request({
             "jsonrpc": "2.0", "method": "initialize",
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
-                       "clientInfo": {"name": "cortex-gateway-lifecycle", "version": "1.0"}},
+                       "clientInfo": {"name": "cortex-gateway-lifecycle", "version": GATEWAY_VERSION}},
             "id": 1,
         })
+        _record_worker_version(init_resp)
         _cc_mcp_request({"jsonrpc": "2.0", "method": "notifications/initialized"}, session_id=sid)
         resp, _ = _cc_mcp_request({
             "jsonrpc": "2.0", "method": "tools/call",
@@ -1368,8 +1404,27 @@ def _task_lifecycle_worker():
     OC just reads check_status — no timeout logic needed on OC side.
     """
     _log("Task lifecycle worker started")
+    _version_mismatch_alerted = False
     while True:
         time.sleep(_LIFECYCLE_CHECK_INTERVAL)
+
+        # Version cross-validation (D57)
+        with _worker_version_lock:
+            current_ver = _worker_version
+        if current_ver and not _check_worker_version_compatible(current_ver):
+            if not _version_mismatch_alerted:
+                _log(f"VERSION MISMATCH: Worker {current_ver}, Gateway expects major {COMPATIBLE_WORKER_MAJOR}")
+                _tg_send(
+                    f"<b>[VERSION-MISMATCH]</b>\n"
+                    f"Worker: {_tg_escape(current_ver)}\n"
+                    f"Gateway expects major: {COMPATIBLE_WORKER_MAJOR}\n"
+                    f"Lifecycle polling paused until versions align."
+                )
+                _version_mismatch_alerted = True
+            continue  # skip this cycle
+        if _version_mismatch_alerted and (not current_ver or _check_worker_version_compatible(current_ver)):
+            _log(f"Version mismatch resolved: Worker {current_ver}")
+            _version_mismatch_alerted = False
 
         now_ts = time.time()
         stale_candidates = []
