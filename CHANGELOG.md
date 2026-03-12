@@ -1,5 +1,27 @@
 # Changelog
 
+## [8.2.0] — 2026-03-12
+
+### Added — Self-Registration via /bootstrap
+- **`POST /bootstrap` endpoint** on Cortex Worker — agents self-register for HMAC secrets using a one-time bootstrap token. No secrets in the repo.
+- **`--bootstrap-token` flag** in `update.sh` — first-time setup calls `/bootstrap`, receives HMAC secret, writes `.env` automatically.
+- **`--agent-id` flag** in `update.sh` — configurable agent identity (default: `oc`).
+- **D1 dynamic secrets** — `agents.hmac_secret` column. Auth checks D1 first, falls back to Cloudflare env var.
+- **Bootstrap security** — rate-limited (5/min/IP), one-time token consumed on use, audit-logged, TG notification to CEO.
+
+### Changed
+- Worker v3.0.0 → v3.1.0 (new `/bootstrap` route + D1 secret support).
+- `auth.ts` — `getAgentSecret()` checks `agent.hmac_secret` (D1) before `env[agent.hmac_secret_env]`.
+- `update.sh` — removed `agent-secrets.json` dependency, added `/bootstrap` flow.
+
+### Migration
+- Run D1 migration: `wrangler d1 execute cortex-db --remote --file=migrations/001-bootstrap.sql`
+- Set bootstrap token for agent: `wrangler d1 execute cortex-db --remote --command "UPDATE agents SET bootstrap_token='<random>' WHERE agent_id='oc'"`
+- Deploy Worker: `wrangler deploy`
+- Agent runs: `./update.sh --bootstrap-token <token>`
+
+---
+
 ## [8.0.1] — 2026-03-11
 
 ### Fixed — cortex-poll.py Board protocol handling

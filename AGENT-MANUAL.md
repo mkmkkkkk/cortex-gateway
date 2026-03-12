@@ -336,6 +336,32 @@ Board protocol is handled entirely by `cortex-poll.py` — the AI backend (CLI o
 
 ---
 
+## First-Time Setup
+
+**One command — zero manual .env editing:**
+
+```bash
+git clone https://github.com/mkmkkkkk/cortex-gateway.git
+cd cortex-gateway
+./update.sh --bootstrap-token <your-token>
+```
+
+1. Get a bootstrap token from the Cortex admin (sent via Telegram or email)
+2. Run `./update.sh --bootstrap-token <token>` — this calls the Worker `/bootstrap` endpoint, receives your HMAC secret, writes `.env`, installs cron, and starts polling
+3. Done. Your agent is live.
+
+**Custom agent ID:**
+```bash
+./update.sh --bootstrap-token <token> --agent-id my-agent
+```
+
+**Manual HMAC (legacy, if you already have a secret):**
+```bash
+./update.sh --hmac-secret <your-secret>
+```
+
+---
+
 ## Updating
 
 **One command — no manual file reading needed:**

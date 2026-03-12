@@ -1,16 +1,23 @@
 #!/bin/bash
 # cortex-gateway update — one command, everything synced.
 # Usage:
-#   ./update.sh                          # normal update
-#   ./update.sh --hmac-secret <secret>   # first-time setup (provides HMAC key)
+#   ./update.sh                                        # normal update
+#   ./update.sh --bootstrap-token <token>              # first-time setup (self-registration)
+#   ./update.sh --hmac-secret <secret>                 # manual HMAC key (legacy)
+#   ./update.sh --agent-id <id>                        # custom agent ID (default: oc)
 #
 # What it does:
 #   1. git pull
 #   2. Shows changelog
-#   3. Auto-creates .env (detects OpenClaw token, accepts --hmac-secret)
+#   3. Auto-creates .env (bootstrap from Worker, or --hmac-secret, or env var)
 #   4. Restarts Gateway if server code changed
 #   5. Installs Board auto-poll cron
 #   6. Connectivity test
+#
+# First-time setup:
+#   1. Get a bootstrap token from Cortex admin (sent via Telegram/email)
+#   2. Run: ./update.sh --bootstrap-token <token>
+#   3. Done. .env is auto-created, cron installed, polling starts.
 #
 # OC: run this, read the output, done. No manual file reading needed.
 
@@ -21,12 +28,18 @@ cd "$SCRIPT_DIR"
 
 # ── Parse args ─────────────────────────────────────────────────
 HMAC_SECRET_ARG=""
+BOOTSTRAP_TOKEN_ARG=""
+AGENT_ID_ARG="oc"
 while [[ $# -gt 0 ]]; do
     case $1 in
         --hmac-secret) HMAC_SECRET_ARG="$2"; shift 2 ;;
+        --bootstrap-token) BOOTSTRAP_TOKEN_ARG="$2"; shift 2 ;;
+        --agent-id) AGENT_ID_ARG="$2"; shift 2 ;;
         *) shift ;;
     esac
 done
+
+WORKER_URL="https://cortex.mkyang.ai"
 
 # ── Colors ────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -88,7 +101,6 @@ if [ ! -f .env ]; then
 
     # --- Detect OpenClaw webhook token ---
     OC_TOKEN=""
-    # Try common OpenClaw config locations
     for cfg in \
         "$HOME/.clawdbot/config.json" \
         "$HOME/.config/openclaw/config.json" \
@@ -96,29 +108,23 @@ if [ ! -f .env ]; then
         "$HOME/.clawdbot/config.yaml" \
         "$HOME/.clawdbot/config.yml"; do
         if [ -f "$cfg" ]; then
-            # JSON config
             if [[ "$cfg" == *.json ]]; then
                 OC_TOKEN=$(python3 -c "
-import json, sys
+import json
 try:
     with open('$cfg') as f:
         c = json.load(f)
-    # Try hooks.token, then hooks.secret, then api.token
-    t = c.get('hooks',{}).get('token','') or c.get('hooks',{}).get('secret','') or c.get('api',{}).get('token','')
-    print(t)
+    print(c.get('hooks',{}).get('token','') or c.get('hooks',{}).get('secret','') or c.get('api',{}).get('token',''))
 except: pass
 " 2>/dev/null)
             fi
-            # YAML config
             if [[ "$cfg" == *.yaml || "$cfg" == *.yml ]]; then
                 OC_TOKEN=$(python3 -c "
-import sys
 try:
     import yaml
     with open('$cfg') as f:
         c = yaml.safe_load(f)
-    t = c.get('hooks',{}).get('token','') or ''
-    print(t)
+    print(c.get('hooks',{}).get('token','') or '')
 except: pass
 " 2>/dev/null)
             fi
@@ -129,7 +135,7 @@ except: pass
         fi
     done
 
-    # --- HMAC secret (priority: arg > env > agent-secrets.json) ---
+    # --- HMAC secret (priority: arg > env > bootstrap) ---
     HMAC_SECRET=""
     if [ -n "$HMAC_SECRET_ARG" ]; then
         HMAC_SECRET="$HMAC_SECRET_ARG"
@@ -137,21 +143,27 @@ except: pass
     elif [ -n "${CORTEX_HMAC_SECRET_OC:-}" ]; then
         HMAC_SECRET="$CORTEX_HMAC_SECRET_OC"
         echo -e "  ${GREEN}Using HMAC secret from environment${NC}"
-    elif [ -f "${SCRIPT_DIR}/agent-secrets.json" ]; then
-        HMAC_SECRET=$(python3 -c "
-import json
-try:
-    with open('${SCRIPT_DIR}/agent-secrets.json') as f:
-        print(json.load(f).get('oc',{}).get('hmac_secret',''))
-except: pass
-" 2>/dev/null)
-        if [ -n "$HMAC_SECRET" ]; then
-            echo -e "  ${GREEN}Using HMAC secret from agent-secrets.json${NC}"
+    elif [ -n "$BOOTSTRAP_TOKEN_ARG" ]; then
+        # Self-registration via /bootstrap endpoint
+        echo "  Bootstrapping with Cortex Worker..."
+        BOOTSTRAP_RESP=$(curl -s -X POST "${WORKER_URL}/bootstrap" \
+            --max-time 10 \
+            -H "Content-Type: application/json" \
+            -d "{\"agent_id\":\"${AGENT_ID_ARG}\",\"token\":\"${BOOTSTRAP_TOKEN_ARG}\"}" 2>/dev/null)
+        BOOTSTRAP_OK=$(echo "$BOOTSTRAP_RESP" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('ok',''))" 2>/dev/null)
+        if [ "$BOOTSTRAP_OK" = "True" ]; then
+            HMAC_SECRET=$(echo "$BOOTSTRAP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin)['hmac_secret'])" 2>/dev/null)
+            echo -e "  ${GREEN}Bootstrap successful — HMAC secret received${NC}"
+        else
+            BOOTSTRAP_ERR=$(echo "$BOOTSTRAP_RESP" | python3 -c "import json,sys; print(json.load(sys.stdin).get('error','unknown'))" 2>/dev/null || echo "connection failed")
+            echo -e "  ${RED}Bootstrap failed: ${BOOTSTRAP_ERR}${NC}"
         fi
     fi
 
     if [ -z "$HMAC_SECRET" ]; then
-        echo -e "  ${RED}HMAC secret not found. Check agent-secrets.json or use --hmac-secret${NC}"
+        echo -e "  ${RED}HMAC secret not found.${NC}"
+        echo "  First-time setup: ./update.sh --bootstrap-token <token>"
+        echo "  Get your token from the Cortex admin."
         ENV_OK=false
     fi
 
@@ -250,7 +262,7 @@ if crontab -l 2>/dev/null | grep -q "cortex-poll"; then
     CURRENT_CRON=$(crontab -l 2>/dev/null | grep "cortex-poll")
     if [ -n "$POLL_MODE" ] && ! echo "$CURRENT_CRON" | grep -q "$POLL_MODE"; then
         echo "  Updating cron to mode=$POLL_MODE..."
-        CRON_LINE="* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC ${POLL_ARGS} >> /tmp/cortex-poll.log 2>&1"
+        CRON_LINE="* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id ${AGENT_ID_ARG} --secret-env CORTEX_HMAC_SECRET_OC ${POLL_ARGS} >> /tmp/cortex-poll.log 2>&1"
         (crontab -l 2>/dev/null | grep -v "cortex-poll"; echo "SHELL=/bin/bash"; echo "$CRON_LINE") | crontab -
         echo -e "${GREEN}  cortex-poll cron: updated (mode=$POLL_MODE)${NC}"
     else
@@ -262,7 +274,7 @@ elif [ -z "$POLL_MODE" ]; then
     echo "  Start OpenClaw or install claude CLI, then re-run ./update.sh"
 else
     echo "  Installing cortex-poll cron (every minute, mode=$POLL_MODE)..."
-    CRON_LINE="* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id oc --secret-env CORTEX_HMAC_SECRET_OC ${POLL_ARGS} >> /tmp/cortex-poll.log 2>&1"
+    CRON_LINE="* * * * * set -a && . ${SCRIPT_DIR}/.env && set +a && python3 ${SCRIPT_DIR}/cortex-poll.py --agent-id ${AGENT_ID_ARG} --secret-env CORTEX_HMAC_SECRET_OC ${POLL_ARGS} >> /tmp/cortex-poll.log 2>&1"
     (crontab -l 2>/dev/null | grep -v "cortex-poll"; echo "SHELL=/bin/bash"; echo "$CRON_LINE") | crontab -
     if crontab -l 2>/dev/null | grep -q "cortex-poll"; then
         POLL_INSTALLED=true
