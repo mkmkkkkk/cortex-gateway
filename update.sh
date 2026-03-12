@@ -129,7 +129,7 @@ except: pass
         fi
     done
 
-    # --- HMAC secret ---
+    # --- HMAC secret (priority: arg > env > agent-secrets.json) ---
     HMAC_SECRET=""
     if [ -n "$HMAC_SECRET_ARG" ]; then
         HMAC_SECRET="$HMAC_SECRET_ARG"
@@ -137,10 +137,21 @@ except: pass
     elif [ -n "${CORTEX_HMAC_SECRET_OC:-}" ]; then
         HMAC_SECRET="$CORTEX_HMAC_SECRET_OC"
         echo -e "  ${GREEN}Using HMAC secret from environment${NC}"
+    elif [ -f "${SCRIPT_DIR}/agent-secrets.json" ]; then
+        HMAC_SECRET=$(python3 -c "
+import json
+try:
+    with open('${SCRIPT_DIR}/agent-secrets.json') as f:
+        print(json.load(f).get('oc',{}).get('hmac_secret',''))
+except: pass
+" 2>/dev/null)
+        if [ -n "$HMAC_SECRET" ]; then
+            echo -e "  ${GREEN}Using HMAC secret from agent-secrets.json${NC}"
+        fi
     fi
 
     if [ -z "$HMAC_SECRET" ]; then
-        echo -e "  ${RED}HMAC secret not provided. Use: ./update.sh --hmac-secret <value>${NC}"
+        echo -e "  ${RED}HMAC secret not found. Check agent-secrets.json or use --hmac-secret${NC}"
         ENV_OK=false
     fi
 
