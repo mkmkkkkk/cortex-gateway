@@ -50,13 +50,14 @@ def _post(endpoint: str, headers: dict, body: bytes, timeout: int) -> tuple[str,
     cmd += ["-d", "@-"]
     r = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout + 5)
     raw = r.stdout.decode()
-    # Split headers from body (HTTP response with -i flag)
-    parts = raw.split("\r\n\r\n", 1)
+    # Split headers from body — use last \r\n\r\n to handle
+    # CONNECT tunnel responses (double header blocks)
+    parts = raw.rsplit("\r\n\r\n", 1)
     resp_headers = parts[0] if parts else ""
-    resp_body = parts[1] if len(parts) > 1 else ""
-    # Extract Mcp-Session-Id
+    resp_body = parts[1] if len(parts) > 1 else raw
+    # Extract Mcp-Session-Id (search all header blocks)
     sid = ""
-    for line in resp_headers.split("\r\n"):
+    for line in raw.split("\r\n"):
         if line.lower().startswith("mcp-session-id:"):
             sid = line.split(":", 1)[1].strip()
     return resp_body, sid
@@ -69,15 +70,21 @@ def main():
     parser.add_argument("--secret-env", default=None, help="Env var name containing HMAC secret")
     parser.add_argument("--endpoint", default=WORKER_URL)
     parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--tools", default=None,
+                        help="Comma-separated tool whitelist (e.g. ping,board_post,board_read)")
     args = parser.parse_args()
 
-    # Resolve secret: --secret-env (safe) > --secret (visible in ps)
+    # Resolve secret: --secret-env (safe) > --secret (prefer)
     secret = args.secret
     if args.secret_env:
         secret = os.environ.get(args.secret_env, "")
     if not secret:
         print("Error: provide --secret or --secret-env", file=sys.stderr)
         sys.exit(1)
+
+    tool_whitelist = None
+    if args.tools:
+        tool_whitelist = set(t.strip() for t in args.tools.split(","))
 
     session_id = ""
 
@@ -101,6 +108,18 @@ def main():
             data, sid = _post(args.endpoint, headers, body, args.timeout)
             if sid:
                 session_id = sid
+            # Filter tools/list response if whitelist is set
+            if data and tool_whitelist and msg.get("method") == "tools/list":
+                try:
+                    resp = json.loads(data)
+                    if "result" in resp and "tools" in resp["result"]:
+                        resp["result"]["tools"] = [
+                            t for t in resp["result"]["tools"]
+                            if t.get("name") in tool_whitelist
+                        ]
+                        data = json.dumps(resp)
+                except (json.JSONDecodeError, KeyError):
+                    pass
             if data and not is_notification:
                 print(data, flush=True)
         except Exception as e:
